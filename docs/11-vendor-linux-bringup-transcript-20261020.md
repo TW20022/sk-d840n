@@ -1,0 +1,497 @@
+# 11 - The vendor 4.19 Linux bring-up transcript was already on disk, and it refutes docs/10
+
+Date: 2026-10-20, found while CI run 75 was still compiling.
+
+## 0. What happened
+
+Since task #26 (RAM-boot of `staging/v419-uImage` + `staging/v419-dtb.bin`), `staging/ctl/serial.log`
+has contained the **vendor 4.19 kernel's own np_133.ko bring-up, printed on this board** - including
+every `idm_*` value the working Linux datapath uses. Nobody had read it: `grep -rl "idm net init ok"
+docs/ ci-build-repo/docs/` returns nothing, and docs/09 + docs/10 therefore built the entire reference
+spec out of the **U-Boot** image instead. Identification of the transcript (not assumed): `Linux
+version 4.19` appears at file offset 0x372d5, 0x8f00 bytes before the quoted lines; the module load
+line directly above reads `init_module: umod=..., len=5208496` = np_133.ko's exact size, and its
+vermagic complaint `magic '4.19.136 SMP mod_unload aarch64' should be '4.19.136+ ...'` is this
+board's 4.19.136+. It is followed at [27.84 s] by `ethdrv_dev_ioctl, brdev_set.port_id 0,
+brdev_set.name eth0, brdev_set.flag 0`.
+
+## 1. The two lines that close task #43
+
+```
+[   15.993777] zx_pon_irq_base_of_init: idm_ddr_phy_start 0x80b23000, idm_ddr_size 0xee5000
+[   18.639872] 1 idm_ddr_base is 000000008be7859e, phy addr is 0x80b23000
+[   18.646611] ddr size(0xee5000), idm used(0xee5000)
+```
+
+The working Linux NP driver hands the NP a **plain CPU DRAM** address, `0x80b23000`, 0xee5000 =
+15.9 MiB, and uses all of it. U-Boot's `idm_ddr_base is 0x00000000b0000000` is the *same variable* in
+the bootloader, where the pool happens to sit in the 0xb0000000 region.
+
+**Verdict on #43: the NP can and does master into CPU DRAM.** docs/10's thesis - "rings and RX buffers
+must be allocated inside 0xb0000000 because that is the only memory the NP can reach" - is refuted, so
+task #39 must NOT be implemented as written there. What `tools/npspace.sh` proved (0xb0000000 is not a
+`+0x30000000` alias of the CPU's DRAM) still stands; what was wrong is the inference drawn from it,
+namely that the NP therefore cannot reach DRAM. The vendor path also explains why run 68's
+`idm+0xb0` completion word advanced while the ring bases held ordinary `dma_addrs`: that was not an
+anomaly to be explained away, it was the vendor's own arrangement.
+
+## 2. Second, independent proof from the binary (offline, reproducible)
+
+Two scripts written this session, both with a positive control because "0 hits" is the most
+dangerous answer this project produces:
+
+- `python staging/npidmsites.py pon/vendor-modules/np_133.ko` ->
+  170 `add Xd, Xn, #0x280, lsl #12` (= nppt + 0x280000 = the IDM block) markers, **196 IDM-relative
+  accesses, 99 distinct offsets**, control store at 0x11dd8 = `str w5, [x0, #0xa4]` present.
+- `python staging/npiddrbases.py pon/vendor-modules/np_133.ko` -> throws the register tracker away:
+  **29 functions** touch the IDM block (`idm_init`, `idm_rx_bp_init`, `idm_rev_bp_init`,
+  `idm_tx_desc_init`, `idm_rx_desc_init`, `idm_net_lan_tx_direct`, ...); among all of them, stores to
+  `[that base, #4]` or `[that base, #8]`, including the `stp w,w,[x,#4]` pair form: **0**. Control:
+  `idm_init` is in the function list.
+
+So **the vendor Linux driver never programs `idm+0x04`/`idm+0x08`, the TX and RX ring bases.** It
+either inherits whatever the bootloader left or sets them through a path that is not an MMIO store in
+this module. Mainline writes both from `dma_alloc_coherent`, so mainline is doing something the
+traffic-proven Linux driver never does - that is a legitimate thing to stop doing, and it is the
+cheapest remaining structural difference.
+
+## 3. New first-ranked suspect: the four RX interrupt mask words
+
+The transcript prints the values, and `kofn.py` on `idm_int_mask_configure_init` gives the registers:
+its tail loads four consecutive words from a static array (`ldr w2,[x19,#0x758/0x75c/0x760/0x764]`,
+the dump loop walks `x21 = 0..3` with `x22 = x19 + 0x758`) and stores them to
+
+| reg | vendor 4.19, traffic-proven | mainline (`zx279133-idm.c:1423-1428`) |
+|---|---|---|
+| `idm+0x44` | `0x071ffbfb` | `ZX279133_IDM_DIRECT_RX_MASK` = `0xf00f` |
+| `idm+0x48` | `0x00200000` | `0x00ff0000` |
+| `idm+0x4c` | `0x00400000` | `0` (comment: "no vendor buffer-release callback") |
+| `idm+0x50` | `0x00800404` | `ZX279133_IDM_LOCAL_MASK` = `0x0f00` |
+
+`[x19+0x758]` -> `+0x44`, `+0x75c` -> `+0x48`, `+0x760` -> `+0x4c`, `+0x764` -> `+0x50`, and `+0x40` is
+written by `idm_net_init`/`idm_int_enable`/`idm_int_disable` instead (mainline writes `0x07ffffff`).
+The four irq lines are the ones the driver requested: `idm-intr0 is 40`, `intr1 41`, `intr2 42`,
+`intr3 43`.
+
+Mainline's model of these registers is "16 low bits split into nibble groups"; the working image has
+bits set at 26, 23, 22, 21, 10 and 2, i.e. a 27-bit field where the vendor spreads sources across all
+four lines. `idm+0x4c = 0` in mainline while the working image holds `bit22`, and `+0x44 = 0xf00f`
+against `0x071ffbfb`, are exactly the kind of divergence that produces **TX completes, RX never
+interrupts, `rx_packets` 0 forever**. Caveat to keep honest: the four values are computed at runtime,
+not a static table (`python` packed-byte search for the 4-word sequence: NOT FOUND), so they are
+*this board's* mask configuration, correct as a measured image to reproduce and not derivable from
+the .ko.
+
+### 3b. The line -> SPI map that turns this from a diff into a mechanism
+
+Two DTs, read together:
+
+- vendor 4.19 (`decompiled/sk-d840n-community-4.19.dts:1931`) gives `idm@19280000`
+  `interrupts = <0 1 4>, <0 2 4>, <0 3 4>, <0 4 4>` = **SPI 1,2,3,4**, and its driver prints them back
+  as `idm-intr0 is 40` ... `idm-intr3 is 43`.
+- mainline (`upstream-read/zx279133.dtsi:467-473`) gives the nppt node
+  `interrupts = <GIC_SPI 5>, <GIC_SPI 1>, <GIC_SPI 2>, <GIC_SPI 3>, <GIC_SPI 4>` with
+  `interrupt-names = "nppt", "rx", "idm", "buffer-release", "local-test"`, and `zx279133-main.c:634`
+  requests **`irqs[1]` = SPI 1** for `zx279133_idm_rx_irq`.
+
+So `+0x44` is the routing word for **the very line mainline's RX handler sits on**. The comparison
+below was computed, not read off by eye (`python`: route each of bits 0..26 to the line whose word
+holds it, vendor `0x071ffbfb/0x00200000/0x00400000/0x00800404` vs mainline
+`0xf00f/0x00ff0000/0/0x0f00`):
+
+| vendor RX-line (line 0) sources | bits |
+|---|---|
+| working image delivers to the RX line | 0,1,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19,20,24,25,26 (22) |
+| mainline delivers to the RX line | 0,1,2,3,12,13,14,15 (8) |
+| **routed to no line at all by mainline** | **4,5,6,7,24,25,26** (7) |
+| moved to line 3 `"local-test"` | 8,9,11 |
+| moved to line 1 `"idm"` - **an IRQ this driver never requests** | 16,17,18,19,20 |
+| pulled onto the RX line that the vendor keeps off it | 2 |
+| `+0x4c`: vendor routes bit 22 to line 2 | mainline writes **0** there |
+
+Fourteen of the twenty-two completion sources the working image delivers to the RX interrupt were
+either stranded on an unrouted bit or sent to a line no handler owns - and five of them (16..20) to an
+IRQ mainline never even requests. That is the first mechanism in this whole investigation that explains
+`rx_packets` 0 *and* leaves TX completions moving, and it does not need the address-space theory at all.
+
+**Shipped:** `zx279133-idm.c` now writes the four measured words verbatim (`0x071ffbfb`, `0x00200000`,
+`0x00400000`, `0x00800404`) and keeps mainline's `+0x40 = 0x07ffffff` enable-all behaviour, so the
+routing and the enable word cannot disagree about which bits exist. SPI2/SPI3 are still not requested
+by this driver, and an unrequested SPI stays masked at the GIC distributor, so reproducing the vendor's
+words for those two lines is faithful without being able to storm the console.
+
+## 4. Warning about the three values shipped in run 75
+
+`idm+0x10c` is a **bitfield**, not a count. `idm_rx_bp_init` does a read-modify-write on the live
+register:
+
+```
+18f3c  ldr  w4, [x3, #0x10c]
+18f40  lsr  w4, w1, #0xc          ; w1 = a size in bytes
+18f44  sub  w4, w4, #1
+18f48  lsl  w4, w4, #0x15         ; << 21
+18f4c  orr  w4, w4, #0x100
+18f50  str  w4, [x3, #0x10c]
+```
+
+For 4096 bytes that yields `0x00600100`. Run 75 writes `ZX279133_IDM_BP_RING_SIZE` = `0x1000` there
+(and at `+0x110`), because `0x1000` is what the *U-Boot* image holds. Both cannot be the right encoding
+for Linux, and the one that came from the Linux transcript is the one with a formula behind it. So if
+run 75 boots and stays silent, do not conclude the mask theory is wrong: `+0x10c/+0x110 = 0x1000` may
+itself be a regression inherited from the bootloader's image.
+
+## 4b. The vendor Linux bring-up register image, extracted from the .ko
+
+`python staging/npidmvals.py pon/vendor-modules/np_133.ko idm_init idm_net_init idm_tx_desc_init
+idm_rx_desc_init` tracks `mov wN,#imm` / `movk` / `orr` per register and reports what each store into
+the IDM block carries. Result, with mainline's value beside it:
+
+| register | vendor Linux (literal) | mainline | U-Boot (docs/09) |
+|---|---|---|---|
+| `+0x054` | `0x06060606` | `0x06060606` | - |
+| `+0x058` | `0x00060606` | `0x00060606` | - |
+| `+0x05c` | `0x07070707` | `0x07070707` | - |
+| `+0x060` | `0x07070707` | `0x07070707` | - |
+| `+0x3fc` | `0x00000f49` | `0x00000f49` | - |
+| `+0x040` | `0x07ffffff` (`idm_net_init`) | `0x07ffffff` | - |
+| **`+0x124`** | **`0x00000080`** | `0x00000040` (since run 75) | `0x00000040` |
+| `+0x000` | RUNTIME (three stores in `idm_init`, one in `idm_rx_desc_init`) | - | `0x01ff0007` |
+| `+0x00c` | RUNTIME (`idm_tx_desc_init`) | `0x04000000` | `0x04000000` |
+| `+0x010`, `+0x0c0`, `+0x2c8`, `+0x5c0`, `+0x070` | RUNTIME - loaded from globals or computed | 128 / `IDM_DESC_MODE` / - / 7 / depth-1 | `0x00000020` / `0` / - / - / - |
+
+Six words the vendor writes as literals are **already exactly what mainline writes**, which is
+independent confirmation that mainline's bring-up was ported faithfully wherever the value is a
+constant. The one constant that disagrees is `+0x124`: the bootloader holds `0x40`, the Linux bring-up
+writes `0x80` (`mov w1, #0x80` at 0x19664 immediately followed by `str w1, [x0, #0x124]` at 0x19668 -
+read in the raw listing, not just inferred from the tracker). Since we are writing a Linux driver, the
+Linux value is the one that ships: **run 77 changes `+0x124` from `0x40` to `0x80`.**
+
+The remaining RUNTIME rows are the honest limit of this method - `+0x00c` and `+0x010` in particular
+are computed from variables in `.data`, so their Linux values are only known from what the board prints
+or from a register read, and §5 established that no register read under the vendor kernel is obtainable.
+
+**Self-check that mattered:** the first version of `npidmvals.py` excluded `ldr` from the
+register-kill list, so `ldr w1, [x1]` at 0x19688 left a stale `w1 = 0x80` live and the script reported
+`+0x010` and `+0x0c0` as literals `0x80` - two invented register values, both plausible-looking, both
+wrong. The corrected run reports them RUNTIME and keeps only `+0x124 = 0x80`, which the raw disassembly
+confirms. Same rule as everywhere else here: an extractor's output is only usable when its control
+lines up with the listing.
+
+## 4c. The run-75 kit read back over serial - the first in-hardware confirmation, and a second blocker
+
+The 15:00 round lost its recorder mid-boot (two `relayloop.sh` instances were alive and fighting for
+COM3 - see the pitfall note in memory; a `send error: 1Write:` wall in `serial.log`), but the kit's
+shell survived and the reads were taken by hand at 15:07-15:09 on `Linux ImmortalWrt 6.18.38+`,
+`root@ImmortalWrt:~#`, uptime 7 min, cmdline `root=/dev/mtdblock5`:
+
+| register | read live on kit 75 | meaning |
+|---|---|---|
+| `+0x0c` | `0x04000000` | the `IDM_TX_CFG_DEPTH` fix **reached the hardware** - first time ever measured |
+| `+0x10c`, `+0x110` | `0x00001000`, `0x00001000` | the BP-ring-count fix reached the hardware |
+| `+0x124` | `0x00000040` | landed, but §4b says the Linux bring-up uses `0x80` → run 77 |
+| `+0x04`, `+0x08` | `0x9a080000`, `0x9a100000` | mainline really does overwrite the ring bases with DRAM `dma_addrs`, replacing U-Boot's `0xb0008000/0xb0028000` |
+| `+0x10` | `0x00000080` | equals the vendor's `+0x124` literal - coincidence, not evidence |
+| `+0x40` | **`0x07ff0000` after `eth0` was brought up** | bits 16..26 are still MASKED for the interface's whole life |
+| `+0x44/48/4c/50` | `0x0000f00f / 0x00ff0000 / 0 / 0x00000ff0` | the pre-fix routing, as §3 predicted |
+| `/proc/interrupts` | line 22 `GICv3 33 Level 19000000.ethernet` count **0 0**; line 25 `GICv3 36 zx279133-idm-local` count 0 | the RX IRQ *is* requested (SPI 1) and `enable_irq()` does run (`zx279133-netdev.c:66`) - it simply has never fired |
+
+That last pair of rows is the important one. It kills a plausible-sounding reading of §3b: the RX
+interrupt was not missing because nobody requested it, and it is not missing because the ring bases are
+in DRAM. **Two IDM-side conditions keep it silent, and the routing words are only one of them**: the
+per-source mask at `+0x40` never clears bits 16..26, and the vendor's routing word for this line
+(`0x071ffbfb`) delivers sources 16,17,18,19,20,24,25,26 there. So run 76/77's routing fix is necessary
+but would still leave RX mute, and `ZX279133_IDM_NAPI_MASK` was widened to `GENMASK(26, 0)` for run 78 -
+`zx279133_idm_open()` unmasks with it and `napi_disable` masks with it, symmetrically.
+
+Order of evidence from here: boot 78, re-read `+0x40` (must become `0x00000000` with `eth0` up), re-read
+`+0x44` (must become `0x071ffbfb`), then watch line 22's count. A non-zero count with `rx_packets` still
+0 moves the fault into descriptor consumption - and only then does the ring-latch question (§5) matter.
+
+## 4d. The vendor DT's IDM geometry table - the parameter set nothing had compared against yet
+
+`decompiled/sk-d840n-community-4.19.dts:1835-1861` carries the whole IDM shape, and it is the source of
+the values np_133.ko computes its bitfields from (the RUNTIME rows in §4b). Compared with
+`zx279133.h`:
+
+| vendor DT property | value | mainline constant | consequence |
+|---|---|---|---|
+| `idm_rx_queue_num` | 24 | `IDM_RX_QUEUES 24` | agree |
+| `idm_tx_queue_num` | 4 | `IDM_TX_QUEUES 4` | agree |
+| `idm_desc_mode` | 0 | `IDM_DESC_MODE 0` | agree (+0x00c0's literal 0x80 in §4b is a different global) |
+| `idm_desc_tx_depth` | `0x400` | `IDM_TX_CFG_DEPTH 0x400` | agree - the run-75 `+0x0c` value |
+| **`idm_desc_rx_depth`** | **`0x400` (1024)** | **`IDM_RX_QUEUE_DESC_DEPTH 2048`** | the RX ring is programmed twice as deep as the vendor's; this one IS register-visible (`+0x70` = depth-1, so 2047 vs 1023) and must stay consistent with the allocated ring |
+| **`idm_rx_normal_bp_ring_depth`** | **`0x2000` (8192)** | `IDM_FREE_RING_SIZE 0x4000` B = 4096 entries | mainline's RX buffer-ring is half the vendor's |
+| `idm_rx_jumbo_bp_ring_depth` | `0x1000` | (jumbo ring unused) | - |
+| **`idm_rx_normal_buffer_num`** | **`0x1000` (4096)** | **`IDM_RX_BUFFER_COUNT 2048`** | the NP is told to expect 4096 normal buffers in the vendor image; mainline posts 2048 |
+| `idm_tx_normal_bp_ring_depth` / `idm_tx_normal_buffer_num` | `0x400` / `0x400` | - | TX side matches its own desc depth |
+| **`idm_ring_free_queue_cnt`** | **3** | 4 extra rings wired (`FREE_RING1..4`) | mainline programs more free queues than the vendor says exist |
+| **`idm_free_ring_depth`** | **`0x10000` (65536)** | `IDM_BP_RING_SIZE 4096` | 16x smaller than the vendor's free ring |
+| `idm_queue_cpuid_map` | 27 entries: all 0 except idx2=3, idx10=3, idx21=1, idx22=2, idx23=3 | `IDM_CPU_RX_QUEUES 16` + `irq_set_affinity_and_hint` spread | the vendor steues *queues to CPUs*, mainline steers CPUs to queues - different model, same intent |
+| `se_hash_ddr_size` | `0x400000` | dts `se-hash` region | agree with the transcript's `0x83968000 size 0x400000` |
+
+Only the bolded rows are candidate bugs, and none of them can explain "the RX interrupt never
+asserts" - which is what §4c just localised. They matter for the *next* question (ring depth and
+buffer count consistency between what the CPU allocates, what the registers claim, and what the NP
+writes back), so they are recorded rather than patched now: a kit that changes four geometry values at
+once, on top of the mask and routing changes in run 78, would make 78's verdict unreadable. If run 78
+produces a non-zero count on the `19000000.ethernet` IRQ line but `rx_packets` still does not move,
+`idm_desc_rx_depth` (`+0x70`) and `idm_rx_normal_buffer_num` are the next two to take from this table.
+
+## 5. Next round, in priority order
+
+**Update after the 14:28 re-run: §5-1 as written is not achievable, and the reason is worth keeping.**
+`tools/vendor419.sh` RAM-booted the vendor pair again at 14:28:49 and the bring-up transcript repeated
+*verbatim* - `1 idm_ddr_base is 000000004031c7e0, phy addr is 0x80b23000`,
+`ddr size(0xee5000), idm used(0xee5000)`, `irq[0] sg_idm_irq_mask_conf(0x71ffbfb)`,
+`idm net init ok`, `nppt init end. ret = 0` - now at [ 60.4 s ] instead of [ 18.6 s ], so it is a genuine
+second boot and those runtime-computed values are stable across boots, not per-boot noise.
+
+What did **not** happen is a shell, and that is structural rather than a timing problem: the vendor
+4.19 kernel mounts the root that is actually flashed - `VFS: Mounted root (jffs2 filesystem) readonly on
+device 31:5.` then `Run /sbin/init as init process` - and that root is OpenWrt/procd built for mainline.
+The console filled with `open: Not a directory` from services that cannot run on 4.19, and 18 probes of
+`echo V419SHELL-$((6*7))` never answered. `netdriver.ko` never loaded either (0 lines for `ethdrv_dev_
+ioctl` / `brdev_set`, which the 10-19 boot had printed at [27.8 s]), because that is started by the
+stock init scripts this root does not have. **So: no devmem reads under the vendor kernel, ever, on this
+flash layout - the module's own dmesg is the only vendor-side evidence obtainable, and it is now
+captured twice.** Anything else the vendor path does must come from the .ko (offline) or from the
+transcript.
+
+That leaves one question the transcript cannot answer, and it is the one docs/10 was written for: does
+the NP **latch** the ring-base registers when its firmware loads, so that a Linux driver writing new
+ring bases after `np init ok` is simply ignored? If it does, the vendor image makes sense - U-Boot's
+`0xb0008000 / 0xb0028000` stay authoritative, np_133.ko never touches them (§2), and the DRAM pool at
+`0x80b23000` is handed over through the buffer-table registers it *does* write (`+0x104/0x108/0x10c/
+0x110`, `idm_rx_bp_init`) - and it also explains run 68's `idm+0xb0` completion word advancing while
+mainline's DRAM ring bases were never consumed. This is now the top remaining suspect, and unlike the
+reachability theory it is testable in one mainline boot: a kit that **does not write `+0x04/+0x08`** and
+instead drives the rings U-Boot left in the np-pool window (mainline already ioremaps that window with
+`devm_ioremap_wc` + `memcpy_toio` for TX payload, so the machinery exists).
+
+Order from here:
+
+1. Boot the run-76 kit (`tools/queuekit.sh 76`, now also reading `+0x44..0x4c` and
+   `/proc/interrupts` before and after the traffic) - this tests the routing fix, and the IRQ delta
+   separates "line never asserts" from "handler runs, ring yields nothing".
+2. If the IRQ counter moves but `rx_packets` stays 0, the fault is downstream of routing and the
+   ring-latch kit is the next one.
+3. `brdev_set.port_id 0` for eth0 in the 10-19 vendor boot is still the only measured answer for the
+   Linux-side egress binding; #37's outport sweep was done against the U-Boot model.
+
+## 6. Instrument notes (so these numbers can be re-taken)
+
+- `staging/npidmsites.py`'s first two attempts reported **0 sites** and its own control said ABSENT;
+  the bug was that the store pattern was anchored on the mnemonic while `ins.op_str` carries only the
+  operands. A negative from a scanner whose positive control fails is not a finding - this is the same
+  class of error as `tools/portattr.sh`'s `data =0` reads.
+- `staging/koxref.py` (RELA-based global xref) reports `RELA sites in .rela.text: 0` for
+  `idm_ddr_base`, `idm_ddr_phy_start` and `idm_ddr_size` even though all three exist as `.bss`
+  globals (0x77e0 / 0xd8 / 0xd0, 8 bytes each). Reason: references to file-scope statics are emitted
+  against the **section symbol**, with the variable's offset carried in the addend, so matching on the
+  variable's own symbol index finds nothing. **Its "0 sites" must never be read as "unused".**
+
+## 4e. Store-only diff: the two IDM words the vendor programs and mainline never writes
+
+`staging/idmgap.py` re-runs the IDM scan of `pon/vendor-modules/np_133.ko` with two changes over
+`staging/npidmsites.py`: it keeps **stores only** (that script lumps `ldr` in, so a read of `+0x3c`
+looked like a write), and it splits the result by function into bring-up vs diagnostics, because
+`np_idm_test_stats_for_wifi` alone touches `+0x014..+0x038` and would dominate any list.
+
+Both controls pass: the TX doorbell store at file `0x11dd8` is present, and `idm+0x004`/`idm+0x008`
+are absent from the store set, which is #43's established negative result re-derived by a new tool.
+
+Vendor bring-up stores that `zx279133-idm.c` never writes at all - two, and only two (five more words
+appear in the tool's list only as "ringed by the TX doorbell helper at run time", never programmed,
+and they are the queue-doorbell arithmetic rather than bring-up configuration):
+
+| word | vendor writer | what the vendor writes |
+| --- | --- | --- |
+| `idm+0x2c8` | `idm_init` @0x19650 | RMW: `ldr`, `and #0xc0ffffff`, `orr #0x12000000`, `str` -> field bits[29:24] = 0x12, rest preserved |
+| `idm+0x490` | `idm_qmg_desc_rd_mode_cfg` | the function is six instructions and this is its only store: `str wzr, [idm, #0x490]` |
+
+The first run reported eight gaps and the second reported seven, and both counts were wrong in
+opposite directions, so the shape of the list matters as much as its content:
+
+- Matching only **literal** offsets in the C hid two words mainline does write: `idm+0x088` is
+  `ZX279133_IDM_RX_RELEASE` (zx279133-idm.c:883, `rx_work | (queue << 12)` - the same shape as the
+  vendor's `idm_pkt_recv_update`: a `queue << 12` field ORed into the count) and `idm+0x0100` is
+  `ZX279133_IDM_BP_REFILL` (`zx279133_idm_rx_flush_refill()`, `writel(count, ...)`), which is what
+  `np_free_bp()` rings with `1` or `0x10000`. So the most tempting theory of the round - "mainline
+  posts RX buffers but never tells the NP" - is **refuted**: the doorbell exists, mainline rings it
+  with a count rather than per buffer.
+- Then folding the per-queue TX doorbell helper's arithmetic (`queue == 0 ? 0x0080 : 4*(queue+39)`)
+  into the same set made `idm+0x0bc` look covered, because it is queue 8's doorbell. That says
+  nothing about the vendor's bring-up `str wzr` there, so the helper range is now reported as a
+  separate bucket: `+0x080/0x0a0/0x0a4/0x0a8/0x0bc` are words mainline only ever rings as a TX
+  doorbell, never programs at bring-up.
+
+That leaves the two words above as the whole remaining bring-up divergence, which is a much smaller
+and much more useful list than the one the tool first printed. Only one of them is new information,
+and it is the one that ships: `+0x2c8` is already left at the vendor's value by U-Boot (docs/09 §4's
+store list includes `+0x2c8` with the same `and 0xc0ffffff` / `orr 0x12000000` RMW, so mainline
+correctly inherits it), while **`+0x490` appears in neither U-Boot's proven store list nor this
+driver's** - so on this board the word has held its reset default through every boot ever observed,
+which is a state no working driver has ever run in. `zx279133_idm_tx_configure()` now writes 0 there
+and the word is saved/restored with the rest of the block.
+
+`idm_qmg_desc_rd_mode_cfg()` is the interesting one: its name says *how the QMG reads descriptors*,
+which is the same question #43 left open (the vendor never writes the ring bases, so the NP must get
+them from its firmware image and something has to say in what mode it reads them). Since neither
+U-Boot's own bring-up nor mainline touches `+0x490`, whatever is in it at boot is what the NP
+firmware left - which is a measurable difference between this board's failing state and the working
+vendor driver, not a guess.
+
+Read on the hardware, 15:48-15:50 on the flashed 24.10.8 system (uptime 402 s at the first probe and
+`22: 0 0 GICv3 33 Level 19000000.ethernet` count 0, `rx_packets` 0), and the answer is not what the
+offline diff suggested:
+
+| word | measured | vendor wants | verdict |
+| --- | --- | --- | --- |
+| `idm+0x010` | `0x00000080` | 128 (RUNTIME) | the read path is live: this is exactly what mainline writes |
+| `idm+0x014` | `0x00800080` | `0x00800080` | second confirmation of the same kind |
+| `idm+0x044` | `0x0000f00f` | `0x071ffbfb` | the flashed run-61 kernel, i.e. the pre-#48 routing - as expected |
+| `idm+0x0bc` | `0x00000000` | 0 | **already correct**, no kit needed (read at `0x00b8`, see below) |
+| `idm+0x2c8` | `0x00112233` | field bits[29:24] = `0x12` | **wrong**: the field is `0x00`, so this is the one real divergence |
+| `idm+0x490` | `0x00000000` | 0 | **already correct** - and the zero is real, not an unmapped read: `+0x48c` = `0x01030101` and `+0x498` = `0x02000000` around it |
+
+Two instrument facts, both of which would otherwise have been read as "the register is dead":
+
+- **The flashed rootfs can read MMIO**, but not with the applets I reached for first: `/dev/mem` is
+  present, `busybox devmem` prints `devmem: applet not found`, `od` is not found, and even
+  `busybox --list` is unavailable. The working primitive is the rootfs' own **`/sbin/devmem2`**
+  (76,208 B, Sep 10 15:54 - it came with the community image, and `tools/zkey` has long used it).
+- `devmem2` performs an **8-byte** access whatever type letter is given, so a 4-aligned but not
+  8-aligned address raises `Bus error` - that is why `+0xbc` and `+0x124` failed while `+0xb8` and
+  `+0x120` worked. Read the pair and take the half that is wanted; and note both words come back in
+  one printed value (low 32 bits = the address asked for, high 32 bits = that + 4), which is why
+  `+0x40` prints as `0xf00f07ff0000`.
+
+So the store-only diff produced its first hardware-verdict before any kit ran: one of its two
+candidates was already satisfied and the other is measurably wrong. `zx279133_idm_tx_configure()`
+now does the vendor's `and 0xc0ffffff` / `orr 0x12000000` RMW on `+0x2c8`; the `writel(0, ...)` on
+`+0x490` stays only because writing the value the vendor writes is parity, not a test.
+
+Why `+0x2c8` reads 0x00 in that field is itself the interesting part. docs/09 §4's U-Boot store list
+*does* contain `+0x2c8` with exactly this `and 0xc0ffffff` / `orr 0x12000000` RMW - so the bootloader
+programs it, and by the time anything can read it under Linux the field is gone. Something between
+the two resets that block, and the obvious candidate is mainline's own NP start: which is precisely
+why the vendor's driver writes the word late, in `idm_init()` after its NP bring-up, rather than
+relying on the bootloader. The same reasoning says the fix must live in the bring-up function that
+runs after the NP is started, not in anything inherited from U-Boot.
+
+A scanner bug found on the way, recorded because it hid a real register: the store pattern
+`(?:w\d+|x\d+)` does not match `wzr`/`xzr`, so on the first run `idm_init`'s `str wzr, [x0, #0xbc]`
+was invisible and `+0xbc` did not appear at all. Writing zero is still a bring-up write.
+
+## 4f. U-Boot's traffic-proven IDM image, recovered from this morning's log
+
+`tools/idmband.sh` ran 10:54:15-10:55:42 and its own log records `traffic=yes` (it answered
+`host 192.168.9.25 is alive` twice, before and after the reads), so the 26 `md` replies it typed into
+`staging/ctl/serial.log` are a reference image of a state that really carries frames. They were never
+parsed at the time - `idmband.sh` only prints "parse serial.log for 1928*" - so the image was sitting
+in the log unexamined while §4e was being written. Re-slicing the log by the `=== >>> HH:MM:SS sent:`
+banners and taking only the 10:53-10:58 window gives, word by word:
+
+| word | U-Boot (proven) | running mainline (flashed run 61, 15:48) | vendor Linux |
+| --- | --- | --- | --- |
+| `+0x00` | `01ff0007` | - | RMW |
+| `+0x04` | `b0008000` | - | **never written** |
+| `+0x08` | `b0028000` | DRAM (`rx_descs_dma`) | **never written** |
+| `+0x0c` | `04000000` | `04000000` (kit 75) | RUNTIME |
+| `+0x10` | `00000020` | `00000080` | RUNTIME (128) |
+| `+0x14..34` | `00010001` | `00800080` | - |
+| `+0x38` | `00001000` | `0000c350` | - |
+| `+0x40` | `07ffffff` | `07ff0000` (wrote `07ffffff`) | `07ffffff` |
+| `+0x44` | `07ffffff` | `0000f00f` (run 61's split) | `071ffbfb` |
+| `+0x48/4c/50` | `0` / `0` / `0` | `00ff0000` / `0` / `0x0f00` | `00200000` / `00400000` / `00800404` |
+| `+0x54..60` | `06060606 00060606 07070707 07070707` | same | same |
+| `+0x6c` | `00000800` | `000007c1` | - |
+| `+0x70` | `000003e8` | `000007ff` | depth-1 |
+| `+0x100` | `00000001` (10:55) / `00000020` (10:51) | - | ring doorbell |
+| `+0x104/108` | `b0000000` / `b0004000` | DRAM pool | DRAM pool |
+| `+0x10c/110` | `00000100` / `00000100` | `00001000` / `00001000` | `(bytes>>12-1)<<21\|0x100` |
+| `+0x114` | `00000400` | - | - |
+| `+0x120/124` | `000003af` / `00000040` | `000007a0` / `00000000` | `+0x124 = 0x80` |
+| `+0x140/144` | `01111111` / `11111111` | - | - |
+| `+0x40c` | `001ffc00` | `00003d00` | - |
+| `+0x5c0` | `00000067` | `00000007` | RUNTIME (7) |
+
+Three consequences, in the order that changes what to build:
+
+1. **`+0x44` has two proven values and kits 76+ took the wrong one by construction.** The bootloader
+   that carries traffic on this board routes *every* source to IRQ line 0 (`0x07ffffff`, and lines
+   1..3 are all zero). The vendor's Linux driver routes `0x071ffbfb` to line 0 and spreads the rest
+   over lines 1..3 - which is the word `§3`/`§4b` copied into the driver, and the difference is only
+   explainable by the vendor having requested three more IRQ lines. Mainline requests one. So if kits
+   78/80 still show the `19000000.ethernet` count at 0, the next value to try is U-Boot's
+   `0x07ffffff`, and it needs no new theory - it is measured, on this board, in a state that worked.
+2. **The ring-base question can be re-opened with data, not reasoning.** U-Boot's descriptor rings sit
+   at `b0008000`/`b0028000` and its buffer/free rings at `b0000000`/`b0004000` - inside the NP window.
+   #39 closed docs/10's "put the rings in the NP window" on the grounds that the *vendor Linux* buffer
+   pool is CPU DRAM (`0x80b23000`), which is true but is about `+0x104/+0x108`, while the descriptor
+   bases `+0x04/+0x08` are written by neither Linux driver and keep whatever U-Boot left. So the
+   working vendor combination is: descriptor rings in the NP window (inherited), buffer pool in DRAM
+   (programmed). Mainline is the only one of the three that points the *descriptor* rings at DRAM, and
+   it is the only one that never receives. This is now a recorded asymmetry rather than a conclusion.
+3. **Most configuration words disagree between the two working references, so they are not the
+   blocker.** `+0x10`, `+0x14..34`, `+0x38`, `+0x6c`, `+0x70`, `+0x40c`, `+0x5c0` all differ between
+   U-Boot's image and the vendor Linux driver's writes, and both of those carry traffic - which is
+   exactly why §4e's method (look for words *neither* reference leaves unwritten) is the one worth
+   spending a kit on, and why mainline's own values for those words cannot be scored as a regression.
+
+Caveat recorded so nobody re-reads this table as a reset-default list: `+0x100` changed between the
+10:51 and 10:55 reads of the same boot (`0x20` then `0x01`), and `+0x120`/`+0x90` differ between
+U-Boot and Linux by amounts typical of counters, so the live words in this table are observations,
+not configuration. The `+0x2c8` value in U-Boot is still not measured - docs/09's entry for it comes
+from a static reading of the blob - which is why `tools/rxproof.sh` now types
+`md.l 0x192802c8 2`, `md.l 0x19280490 2` and `md.l 0x19280040 4` in the same window it uses to boot
+a kit.
+
+## 4g. Cold-hand-over reads at 16:01 (tools/ubidm.sh): what U-Boot really leaves, and two corrections
+
+The 16:00 smart-plug cut gave a cold boot, `tools/ubidm.sh` caught the prompt at probe 15, typed five
+`md.l` reads, then `run bootcmd` - the board resumed normally (serial shows the flashed mainline
+reaching `eth0: Link is Up` at 16:03), so nothing about the flash state changed.
+
+| word | U-Boot, cold, 16:01 | U-Boot, after `ping`, 10:54 | running mainline, 15:48 |
+| --- | --- | --- | --- |
+| `+0x00` | `03c30007` | `01ff0007` | - |
+| `+0x04` | `00000000` | `b0008000` | DRAM |
+| `+0x08` | `00000000` | `b0028000` | DRAM |
+| `+0x0c` | `04000000` | `04000000` | `04000000` |
+| `+0x40` | `07ffffff` | `07ffffff` | `07ff0000` (wrote `07ffffff`) |
+| `+0x44` | `07ffffff` | `07ffffff` | `0000f00f` |
+| `+0x100..108` | `0 / 0 / 0` | `1 / b0000000 / b0004000` | - |
+| `+0x10c` | `fffffe00` | `00000100` | `00001000` |
+| `+0x2c8` | `00112233` | (not read) | `00112233` |
+| `+0x2cc` | `06304922` | (not read) | `06304922` |
+| `+0x490` | `00000000` | (not read) | `00000000` |
+
+**Correction 1 - §4f's ring-base asymmetry is gone.** The NP-window ring addresses in this morning's
+table were not handed over by the bootloader at all: they appear only in a boot where U-Boot's own
+network stack ran (`ping`, `tftpboot`), and a cold hand-over leaves `+0x04`, `+0x08`, `+0x104`,
+`+0x108` at **zero**. So "U-Boot puts the descriptor rings in the NP window and mainline is the only
+one that points them at DRAM" was reading an activity artefact, and #39's refutation of docs/10 stands
+on better grounds than §4f gave it. What replaces it is a sharper question: the vendor Linux driver
+never writes `+0x04/+0x08` either, and a *normal* flash boot hands those words over as 0, so under the
+working vendor driver the NP runs with descriptor-ring base registers at 0 - which means 0 is not
+"unset" for those words, it is a value with meaning (most plausibly "use the address the NP firmware
+chose itself"). Mainline writing a real DRAM address there is therefore not obviously equivalent, and
+it is the one remaining structural difference between mainline and the driver that works. It is testable
+in one kit (`writel(0, idm + 0x0004); writel(0, idm + 0x0008)`) but only after kit 80, since it changes
+the same datapath.
+
+**Correction 2 - docs/09's static claim that the bootloader programs `+0x2c8` is wrong, and kit 80 is
+now the only thing that ever sets it.** Cold hand-over reads `0x00112233`, i.e. bits[29:24] = 0x00 -
+byte for byte what the running mainline reads. So nothing in this board's boot chain ever writes the
+field, and `0x00112233 / 0x06304922` is the block's reset signature (an incrementing pattern in
+neighbouring words, not data). That makes the vendor's `and 0xc0ffffff / orr 0x12000000` the only
+writer the field has ever had on this device, which is exactly the kind of divergence that has been
+productive here - and it rules out the "mainline erases what U-Boot set" class of bug for this word,
+because U-Boot sets nothing.
+
+`+0x490 = 0` is likewise a reset default rather than something mainline inherited, so kit 79's
+`writel(0, idm + 0x0490)` is confirmed to be parity, not a test. `+0x40/+0x44 = 07ffffff / 07ffffff`
+at cold hand-over confirms §4f's point 1: the state that carries traffic has every source unmasked and
+every source on line 0, so if kit 78/80's interrupt count stays 0 the routing value to try next is
+`0x07ffffff`, with no new theory required.

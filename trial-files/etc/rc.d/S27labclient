@@ -1,0 +1,271 @@
+#!/bin/sh
+# Trial-only: put a client on the LAN side of the router, inside the board.
+#
+# The bench has one cable: the test PC's.  So the LAN side of the router has
+# no external client, and the plan's "a client on the LAN reaches the
+# internet" can only be shown by a client the board makes itself.  This one is
+# a veth pair:
+#
+#   labhost0  is a bridge port of br-lan - the LAN side, exactly where a
+#             laptop in a jack would sit;
+#   labcli0   is the other end, in its own network namespace when the kernel
+#             has namespaces, so it has its own stack: it takes a DHCP lease
+#             from the board's own dnsmasq and reaches the internet through
+#             the router's NAT, and nothing it does is the board's own traffic.
+#
+# The kernel needs CONFIG_VETH for the pair and CONFIG_NET_NS for the
+# namespace; both are pinned by scripts/configure-sk-d840n.sh.  Without the
+# namespace the client end stays in the root namespace and still takes its
+# lease and still goes out through the WAN - weaker, but it still shows the
+# DHCP server, the bridge and the NAT working, and the log says which of the
+# two it was.
+#
+# Nothing here writes flash.  It only configures the running system.
+LABNS=labcli
+LABH=labhost0
+LABC=labcli0
+BR=br-lan
+STATUS=/tmp/labclient.status
+
+log() { echo "trial: client: $*" >/dev/kmsg; }
+
+# The bridge has to be there: netifd builds it a moment after the network
+# init returns, and S26nat runs right after that.
+i=0
+while [ $i -lt 30 ]; do
+	[ -e "/sys/class/net/$BR" ] && break
+	i=$((i + 1))
+	sleep 1
+done
+[ -e "/sys/class/net/$BR" ] || { log "no $BR - there is no LAN to be a client of"; exit 0; }
+
+# The pair, once.  A second run of this script must not fail on an existing
+# pair, because the lab re-runs it by hand.
+if ! ip link show "$LABH" >/dev/null 2>&1; then
+	ip link add "$LABH" type veth peer name "$LABC" 2>/dev/null || {
+		log "cannot create a veth pair - CONFIG_VETH is not in this kernel?"; exit 0; }
+fi
+
+# The client's own stack, if the kernel has namespaces.
+#
+# This has to be re-runnable: the router script and this one are run again
+# whenever the upstream port changes hands, and the second run must not
+# quietly drop the client out of its namespace.  The first version created
+# the namespace unconditionally, so a second run failed to move the client
+# end into it (it was already there), fell back to the root namespace, and
+# the "the client is in its own stack" evidence was lost - while everything
+# still looked like it had worked.
+INNS=0
+if ip netns list 2>/dev/null | grep -q "^$LABNS"; then
+	# The namespace is already there: is the client end still in it?
+	if ip netns exec "$LABNS" ip link show "$LABC" >/dev/null 2>&1; then
+		INNS=1
+	else
+		ip netns del "$LABNS" 2>/dev/null
+	fi
+fi
+if [ "$INNS" = 0 ]; then
+	if ip netns add "$LABNS" 2>/dev/null; then
+		if ip link set "$LABC" netns "$LABNS" 2>/dev/null; then
+			INNS=1
+		else
+			ip netns del "$LABNS" 2>/dev/null
+		fi
+	fi
+fi
+
+# The board-side end is a bridge port of the LAN.
+ip link set "$LABH" master "$BR" 2>/dev/null
+ip link set "$LABH" up 2>/dev/null
+
+# The lease script.  It applies the address and the route and deliberately
+# does not touch /etc/resolv.conf: the namespace shares the mount namespace,
+# so a resolver written here would be the board's resolver, and the board's
+# own name resolution must not depend on a lab client.
+cat > /tmp/labclient-dhcp.sh <<'EOF'
+#!/bin/sh
+# The lease, applied in whichever convention this client uses.
+#
+# This image has no udhcpc package of its own: the client is busybox's, and
+# busybox's udhcpc calls the script ONCE, with $1 = "bound" (or "renew" or
+# "deconfig"), and hands the whole lease over in the environment:
+# $ip, $subnet, $router, $dns, $interface, $broadcast.
+#
+# Two things about it are easy to get wrong, and both were wrong here:
+#
+#   * it does not call the script once per option.  There is no $2 naming
+#     the option - that is the OTHER convention, the standalone udhcpc's -
+#     so a script written for it ("case $2 in ip)") does nothing at all
+#     under busybox, and "nothing happens" looks exactly like "there is no
+#     network out there".
+#   * it does not export "mask", and what it exports as $subnet is the
+#     NETMASK (255.255.255.0), not a network address.  The board's own
+#     busybox says so in its default script:
+#         ip addr add $ip/${subnet:-255.255.255.0} ... dev $interface
+#
+# The other convention is accepted as well, because a script that only
+# understands one of them fails silently on the other.
+#
+# The prefix length is worked out from whatever the client exports: a
+# prefix length, a netmask, or a network address are all accepted.
+pfx_of() {
+	case "$1" in
+	'') echo 24 ;;
+	*[!0-9.]*) echo 24 ;;
+	*.*)
+		case "$1" in
+		255.255.255.*) echo 24 ;;
+		255.255.*.*) echo 16 ;;
+		255.*.*.*) echo 8 ;;
+		*) echo "$1" | awk -F. '{n=0; for (i=4;i>=1;i--) { if ($i=="0") n++; else break } p=8*(4-n); if (p<=0) p=24; print p}' ;;
+		esac ;;
+	*) echo "$1" ;;
+	esac
+}
+
+first_of() {
+	# A client may hand over a list ("gw1 gw2"); the first one is used.
+	set -- $1
+	echo "$1"
+}
+
+if [ -z "$2" ]; then
+	# busybox's convention: one call for the whole lease.
+	case "$1" in
+	bound|renew)
+		[ -n "$ip" ] || exit 0
+		pfx=$(pfx_of "${mask:-}")
+		[ -n "$pfx" ] || pfx=$(pfx_of "$subnet")
+		ip addr replace "$ip/$pfx" dev "$interface" 2>/dev/null
+		gw=$(first_of "$router")
+		[ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && \
+			ip route replace default via "$gw" dev "$interface" 2>/dev/null
+		# The resolver is deliberately not touched here: this script runs inside
+		# the client's network namespace, which shares the mount namespace, so a
+		# resolver written here would be the board's resolver.
+		;;
+	deconfig)
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		;;
+	esac
+	exit 0
+fi
+
+# The standalone udhcpc's convention: one call per option.
+case "$2" in
+ip)
+	pfx=$(pfx_of "${mask:-}")
+	[ -n "$pfx" ] || pfx=$(pfx_of "$subnet")
+	ip addr replace "$ip/$pfx" dev "$interface" 2>/dev/null
+	;;
+subnet)
+	# The connected route comes with the address above.  A "subnet" line
+	# that carries a netmask is not a route at all, so it is dropped
+	# rather than turned into one.
+	;;
+router)
+	gw=$(first_of "$router")
+	[ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && \
+		ip route replace default via "$gw" dev "$interface" 2>/dev/null
+	;;
+dns)
+	# The resolver is deliberately not touched here either, for the same reason.
+	;;
+esac
+exit 0
+
+EOF
+chmod 755 /tmp/labclient-dhcp.sh
+
+if [ "$INNS" = 1 ]; then
+	ip netns exec "$LABNS" ip link set lo up 2>/dev/null
+	ip netns exec "$LABNS" ip link set "$LABC" up 2>/dev/null
+	ip netns exec "$LABNS" udhcpc -i "$LABC" -n -q -t 3 -T 4 \
+		-s /tmp/labclient-dhcp.sh >/tmp/labclient-dhcp.log 2>&1
+else
+	ip link set "$LABC" up 2>/dev/null
+	udhcpc -i "$LABC" -n -q -t 3 -T 4 \
+		-s /tmp/labclient-dhcp.sh >/tmp/labclient-dhcp.log 2>&1
+fi
+
+# The evidence, and a heartbeat that keeps it fresh: the lease, whether the
+# internet answers, and the conntrack entry that shows the flow went through
+# the NAT.
+#
+# WHAT IS PINGED
+#
+# One address is not enough: the bench is in a network where 8.8.8.8 is not
+# reliably reachable, and a ping that fails for that reason looks exactly like
+# a router that does not forward.  So the list is walked and the first answer
+# wins - and the address that answered is written down, so the record says
+# which one it was.  /etc/labtarget can set the list; the default is the
+# addresses that answer in this region first.
+#
+# The spaces in the list are the separators, so they must survive the read:
+# "tr -d '\r\n '" took the spaces away as well, and the list turned into one
+# long word - "223.5.5.5119.29.29.29180.76.76.768.8.8.81.1.1.1" - which is
+# not an address at all.  The client then pinged nothing, the status file said
+# "no answer from any of: ..." and the whole router looked broken, while the
+# router was fine: measured 2026-10-25 00:41, the same client pinged
+# 223.5.5.5 twice with no loss through the very same NAT.
+#
+# Only the line ends are stripped.  A list may be written on one line with
+# spaces or on one line per address; both are read the same way.
+TARGETS=$(cat /etc/labtarget 2>/dev/null | tr -d '\r\n')
+[ -n "$TARGETS" ] || TARGETS="223.5.5.5 119.29.29.29 180.76.76.76 8.8.8.8 1.1.1.1"
+
+(
+	while true; do
+		if [ "$INNS" = 1 ]; then
+			addr=$(ip netns exec "$LABNS" ip -4 addr show dev "$LABC" 2>/dev/null |
+				awk '/inet /{print $2; exit}')
+		else
+			addr=$(ip -4 addr show dev "$LABC" 2>/dev/null |
+				awk '/inet /{print $2; exit}')
+		fi
+		ping_out=""
+		ping_ip=""
+		for t in $TARGETS; do
+			# The answer is decided by ping's own exit code, not by
+			# reading its output: this image's ping is busybox's, and
+			# busybox's last two lines are
+			#
+			#   1 packets transmitted, 1 packets received, 0% packet loss
+			#   round-trip min/avg/max = ...
+			#
+			# which contains neither the "bytes from" line (that one is
+			# third from the end) nor the "1 received" of iputils.  The
+			# first version of this script looked for both, so a client
+			# that reached the internet perfectly well was reported as
+			# having reached nothing - measured 2026-10-25 00:41 with
+			# the very same NAT that carried the reply.
+			#
+			# The whole output is kept, not just the last two lines:
+			# the "64 bytes from ..." line is the one that names the
+			# answer, and it is what a reader of the status file wants
+			# to see.
+			if [ "$INNS" = 1 ]; then
+				ip netns exec "$LABNS" ping -c 1 -W 3 "$t" >/tmp/labping.txt 2>&1
+			else
+				ping -c 1 -W 3 "$t" >/tmp/labping.txt 2>&1
+			fi
+			if [ $? -eq 0 ]; then
+				ping_out=$(tr '\n' ' ' </tmp/labping.txt)
+				ping_ip="$t"
+				break
+			fi
+		done
+		[ -n "$ping_ip" ] || ping_out="no answer from any of: $TARGETS"
+		{
+			echo "client: $LABC (netns: $INNS)"
+			echo "lease: $addr"
+			echo "ping ${ping_ip:-none}: $ping_out"
+			echo "conntrack:"
+			grep '192\.168\.9\.' /proc/net/nf_conntrack 2>/dev/null | head -n 5
+		} >"$STATUS" 2>/dev/null
+		sleep 30
+	done
+) &
+
+log "client up: $LABH is a port of $BR, $LABC is the client (netns: $INNS)"
+exit 0

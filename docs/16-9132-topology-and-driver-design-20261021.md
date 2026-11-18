@@ -1,0 +1,526 @@
+# 16 — SK-D840N 的 9132 拓扑与驱动设计（2026-10-21）
+
+本文件是 G2 门的设计输入。G1（`docs/15-switchko-init-diff-20261020.md`）已经把厂商
+`switch.ko` 的 init 写集和 mainline 的差集列出来了，但那 14 条差集**不足以**解释
+"9132 的端口没有 bring-up"，原因是差集的前提搞错了：本轮在活板上量到的事实表明，
+**9132 根本不是"差集里少了几笔"的问题，而是 mainline 侧从来没有一条能到 9132 的
+数据通路**。本文件记录量到的事实、由此推出的架构，以及据此写出的驱动设计。
+
+所有活板数据都是只读取到的（`/proc/pon/*`、`/proc/device-tree/*`、`/sys/class/net/*`、
+`dmesg`）；没有写 flash，没有动模块，没有改板子配置。
+
+---
+
+## 1. 一句话结论
+
+**SK-D840N 上的 9132，就是 SR1010 上 RTL8372N 的同一个角色：一颗挂在 SoC 的 XMAC0
+LAN 通道上的外部交换芯片。** mainline 树里已经有这个角色的完整实现
+（`zx279133-rtl8372n.c` + `zx279133-lan-conduit.c` + `zx279133-lan.h` 的父子服务
+接口），只是它写死了 RTL8372N。计划里 W2 要新建的 `zx279133-switch.c`，就是把这套
+机制照搬给 9132。
+
+而现在 `kernel-overlays/.../zx279133-sk-d840n.dts` 把 `&nppt` 指向
+`phys = <&uni_serdes>` / `pcs-handle = <&xpcs0>`，**而 mainline 的 `zx279133-mac.c`
+写的是 `ZX279133_XMAC1_BASE`（0x180000）** —— 寄存器基址和 PCS 属于两个不同的 MAC。
+这条错配就是"lane 上一个字节都不动"的直接原因（详见 §4.3）。
+
+---
+
+## 2. 活板量到的事实
+
+### 2.1 端口与网口
+
+| 厂商 switch port | 含义 | enable | link | 活板取证 |
+|---|---|---|---|---|
+| sw0 | UNI 口 1 | 1 | 0 | `sw_port_enable_get` / `sw_port_linkstate_get` |
+| sw1 | UNI 口 2 | 1 | **1** | **PC 插的就是这个口** |
+| sw2 | UNI 口 3 | 1 | 0 | |
+| sw3 | UNI 口 4 | 1 | 0 | |
+| sw4 | outerphy | 1 | 0 | `outerphy_mode=5,outerphy_name=phy_RTL8226` |
+| sw5 / sw6 | 非 smac（xmac0/1_to_extend） | — | 1, speed 6 | `smac_get_port_enable` 报 `error port=5/6` |
+| sw7 | invalid | — | — | `sw_port(7) is not unvalid smac` |
+
+每口的隔离使能、VLAN 过滤掩码、ingress 帧模式**全部为 0**
+（`sw_port_isolate_get` → `enable:0`，`tm_port_vlan_filter_get` → `pp_vlTagMsk:0`，
+`sw_vlan_port_inframemode_get` → `mode:0`，端口 0..7 全部如此）。
+
+### 2.2 9132 是一颗扁平的无标签学习桥
+
+厂商 FDB（`echo show > /proc/pon/tm_debug/tm_mactable_fdb_show`）在活板上只有一条：
+
+```
+mac_addr = 84:47:09:5b:bd:2c      <- 本机 PC 的 MAC
+vid      = 0x0000
+port_id = 2
+```
+
+`vid = 0`、每个口的 VLAN 过滤掩码为 0、ingress 帧模式为 0 —— 三条独立证据一致地
+说明：**这台机器上的 9132 不做 VID→口的映射，它是一颗按 MAC 学习转发的透明桥。**
+
+这条事实直接改写了 G1 差集里 D9/D10/D11/D12（默认 VLAN 优先级 / untag SVID /
+vlancfg / flood 目的口）的意义：厂商自己在跑的系统里根本没用这些字段，往里写
+transport VID **不像是"补齐缺失"，更像是"给一颗不需要 VLAN 的芯片强加 VLAN 语义"**。
+所以这一轮的 G2a 改动里，PVID 写入仍然保留（它同时是"厂商 init 到底写了什么"的
+对照实验），但**不再把它当作让端口工作的必要条件**；真正必要的是 §2.3 和 §2.4。
+
+### 2.3 四个 UNI 口的内部 PHY 在 MDIO 0x0A–0x0D
+
+活板设备树里，**两个 MDIO 控制器（`soc/mdio@14f01000` = mdio0，
+`soc/mdio@14f02000` = mdio1）都带一个 `uni-phy` 属性**，内容是同一个 u32 数组：
+
+```
+00000000  00 00 00 0a  00 00 00 0b  00 00 00 0c  00 00 00 0d
+00000010  00 00 00 05  00 00 00 1c  00 00 00 02
+```
+
+即 `{ 0x0a, 0x0b, 0x0c, 0x0d, 0x05, 0x1c, 0x02 }`。
+
+- `0x0a..0x0d` —— 四个内部 UNI PHY，**计划原文写的"四个 PHY 0x0A–0x0D"完全正确**；
+- `0x05` —— jack 4 的 RTL8226，mainline 的板级 DTS 已经把它声明在 `&mdio1` 的地址 5；
+- `0x1c` / `0x02` —— 未解释（见 §6 未决项）。
+
+厂商的"端口使能"就是走这条 MDIO：`np_133.ko` 的 `smac_set_port_enable()` →
+`zte_set_gephy_enable(phy, en)` → 读 BMCR、清 bit 11（POWERDOWN）、写回，
+底层是 `zx_mdio_0_read/write`，**即 MDIO 控制器 #0**。
+→ G2b 的实现路径因此是确定的：`mdiobus_read/write(bus, 0x0a..0x0d, MII_BMCR)`。
+
+### 2.4 SoC 的 MAC 结构
+
+活板厂商设备树里有 **mainline dtsi 里根本没有的节点**：
+
+```
+soc/rgmii@15900000   compatible = "zte,zx279133-rgmii"   (status = "disabled")
+```
+
+`/proc/pon/outer_phy` 说 `xmac0: phy_RTL8226` —— 厂商的 xmac0 挂的是那颗独立 RGMII
+MAC，也就是 jack 4。mainline 树里既没有这个节点也没有它的驱动，所以 **jack 4 在
+mainline 下不可能通**，这与计划 §"非目标"一致（jack 4 不是门槛）。
+
+厂商 dmesg 里与 MAC 相关的行：
+
+```
+[16.070651] xmac0_pcs_base is 0xffffff8014000000
+[16.35-16.52] smac_init: smac_pkt_filter = 0x80000001, mac = 0x0 / 0x1 / 0x2 / 0x3
+[18.673472] xmac0 is used
+[18.697611] mac 1 phy status changed: 1000M full-duplex
+[19.249948] g_mii_dev_name[0]  sw
+[19.258858] g_mii_dev_name[1]  pon
+[19.552293] Init switch module
+[19.672259] zy switch all port count:7
+[19.676005] switch config 9132 GPON  mode!
+```
+
+- `smac_init` 跑了 **4 次，mac = 0,1,2,3** —— NP 里有 4 个 SOPC MAC 通道，对应 9132 的
+  四个 UNI 口（厂商的 `sw_port_change_to_smac_index(p) = p`）；
+- 厂商 MII 设备表只有两项：`sw`（9132 的 CPU 口）和 `pon`（PON 侧）；
+- `xmac0 is used` 出现在建网口之前，而 `g_mii_dev_name[0] = sw` —— **9132 的 CPU 口
+  跑在厂商的 xmac0 上**。
+
+### 2.5 活板网口与 MAC
+
+```
+sw    d0:45:8d:84:08:fc     9132 的 CPU 口
+pon   00:d0:d0:61:62:00     PON 侧
+idm0  d0:45:8d:84:08:fe
+idm1  d0:45:8d:84:08:fd
+eth0  d0:45:8d:84:08:ff     = RGMII MAC + RTL8226 = jack 4
+eth1  d0:45:8d:84:09:00     在 br-lan，承载着 PC 的全部流量 = 9132 的 UNI 口
+eth2  d0:45:8d:84:09:01     rx=0
+eth3  d0:45:8d:84:09:02     down
+```
+
+厂商靠 `netdriver.ko` 给每个 UNI 口一个**虚拟 MAC**（基址递增），并在 9132 的 FDB 里
+把这些虚拟 MAC 绑到对应口，从而"按目的 MAC 选出口、按入口 port id 分发 RX"。
+br-lan 里只有 `eth1` —— 即本机 PC 所在的那一口。
+
+---
+
+## 3. mainline 树里已有的东西
+
+从 `cnjn/linux-mainline-zte-zxslc-sr1010`（SHA `96e5a241…`，CI 用的同一个树）读出：
+
+### 3.1 两个 MAC 窗口
+
+`drivers/net/ethernet/zte/zx279133.h`：
+
+```c
+/* XMAC0 carries the LAN; the RTL8372N driver owns it. */
+#define ZX279133_XMAC0_BASE	0x140000
+#define ZX279133_XMAC1_BASE	0x180000
+```
+
+`drivers/net/ethernet/zte/zx279133-mac.c` 只用 `ZX279133_XMAC1_BASE`，即 **NPPT 自己
+的 MAC**。
+
+### 3.2 LAN conduit
+
+`drivers/net/ethernet/zte/zx279133-lan-conduit.c`（Kconfig 里的
+`ZTE_ZX279133_LAN_CONDUIT`，`bool ... default y`，编进内核）：
+
+> Build the XMAC0 LAN conduit netdev as a **child of the ZX279133 NPPT controller**.
+> The conduit is used as a DSA CPU-facing netdev. Shared DMA and datapath ownership
+> remains in the parent driver.
+
+它在 `&nppt` 节点下注册一个名为 `lan-cpu%d` 的网口，所有收发动作都转发给父驱动的
+服务接口。
+
+### 3.3 父子服务接口
+
+`drivers/net/ethernet/zte/zx279133-lan.h` 定义了 `zx279133_lan_service`，父驱动
+（NPPT）实现、子驱动（交换机）调用：
+
+```
+nppt_read / nppt_write        父驱动独占的 MMIO 映射
+xmac_lock / xmac_unlock
+datapath_get / set_ready / quiesce / put
+set_dsa_active
+netdev_setup / teardown / open / stop / xmit / tx_timeout
+netdev_get_stats64 / change_mtu / setup_tc
+port_wan_set(vid, wan)        把某个 transport VID 的 LAN 口切成 WAN 型
+```
+
+### 3.4 RTL8372N 驱动就是模板
+
+`drivers/net/ethernet/zte/zx279133-rtl8372n.c`（229 KB，Kconfig 里的
+`ZTE_ZX279133_RTL8372N`）的 probe 顺序：
+
+1. `dev_get_drvdata(dev->parent)` 取父服务，`zx279133_lan_service_valid()` 校验；
+2. `zx279133_lan_service_datapath_get()` 抢占共享数据面；
+3. `zte,mdio-handle` 取交换机自己的 MDIO 器件；
+4. `devm_of_phy_get(dev, parent_np, "lan-serdes")` 从**父节点**取 Uni-SerDes PHY，
+   `phy_set_mode_ext(..., PHY_INTERFACE_MODE_USXGMII)` + `phy_power_on()`；
+5. `of_parse_phandle(parent_np, "zte,lan-pcs-handle", 0)` 取 XPCS0，`pm_runtime_resume_and_get()`；
+6. `zx279133_lan_xpcs_configure()` → `zx279133_lan_xmac_configure()` →
+   `zx279133_lan_datapath_enable()`；
+7. 配置交换机（VLAN/PVID/隔离），注册 DSA。
+
+**它占用的正是 XMAC0 + XPCS0 + uni_serdes。** SR1010 上这是 RTL8372N 的 CPU 口；
+SK-D840N 上这就是 9132 的 CPU 口。
+
+---
+
+## 4. 由此得出的差距
+
+### 4.1 差距一：mainline 没有一条到 9132 的数据通路
+
+`&nppt` 现在被 overlay 指向 `phys = <&uni_serdes>` / `pcs-handle = <&xpcs0>`，
+但 `zx279133-mac.c` 写的是 **XMAC1** 的寄存器。XMAC0（lane 真正那一侧的 MAC）
+从来没有被 mainline 编程过 —— 这就是历次试跑"lane 上一字节都不动"的原因，
+而且和 PHY 有没有接上无关。
+
+厂商侧对照：U-Boot 在这个 jack 上跑的是 `mode_eth_1gbase_x_cfg` +
+`uni serdes init succeed` + `xmac 0 speed set 2 in sgmii`，**用的是 xmac0**。
+
+### 4.2 差距二：9132 的 UNI 口没有 MAC 通道
+
+NP 里的 4 个 SOPC MAC 通道（厂商 `smac_init` 的 mac=0..3）mainline 一个都没用。
+mainline 的 NPPT 只有一个网口，挂在 XMAC1 上。
+
+### 4.3 差距三：9132 芯片本身没有被配置
+
+G1 的 14 条差集说的就是这件事。本轮已按计划实现其中的"端口属性字 + PVID"（G2a），
+并补上了厂商真正用来"使能端口"的那一笔（PHY 的 BMCR，G2b）。
+
+### 4.4 差距四（计划与树的冲突）：per-port netdev
+
+计划 G2 判据要求 `/sys/class/net` 出现 **eth1/eth2/eth3**，即每个 UNI 口一个网口。
+
+但 mainline 的父服务接口只支持**一个** conduit 网口：`zx279133_lan_netdev_setup()`
+把 `eth->lan_ndev = ndev`（单个）。SR1010 上多出来的 4 个用户口是 **DSA** 建的
+（`DSA_TAG_PROTO_ZX279133_RTL8372N` 标签器负责在 conduit 上插/拔 transport VID）。
+
+所以在"不做 DSA"的前提下，要得到 per-port 网口，**必须给父驱动加一个 per-port 的
+服务接口**（父驱动按 vport 分发 RX，每个 vport 一个网口）。这不是小改动。
+
+**建议（自主决断）：先按 DSA 路线做。** 理由：
+
+- 树里已有可复用的标签器与 conduit，per-port 网口、per-port 隔离、per-port VLAN
+  全部是现成机制；
+- 9132 侧只需要把"transport VID → 口"这件事做对，这与厂商的 FDB 虚拟 MAC 方案
+  是两套机制，而 VID 方案能直接复用 mainline 已经写好的 PPU 侧逻辑
+  （`zx279133_lan_vport_mf[]`、`zx279133_lan_vport_mode_write()`、
+  `zx279133_lan_vport_wan_set()`，VID 59..62）；
+- 不做 DSA 就要改父驱动的服务接口，改动面更大且没有现成参照。
+
+计划里"不做 DSA/switchdev"这条约束的由来，是在还不知道树里已有 LAN conduit 与
+lan_service 的前提下写的；本文件把它改判为"用 DSA，但不新写 tagger"。
+
+---
+
+## 5. 驱动设计（W2 落地形态）
+
+### 5.1 文件
+
+| 文件 | 作用 | 状态 |
+|---|---|---|
+| `kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c` | 9132 交换机子驱动 | 待写 |
+| `kernel-overlays/drivers/net/ethernet/zte/Makefile` | 树侧 Makefile **整份**覆盖 + 新文件 | 待写 |
+| `kernel-overlays/drivers/net/ethernet/zte/Kconfig` | 树侧 Kconfig 整份覆盖 + 新条目 | 待写 |
+| `kernel-overlays/arch/arm64/boot/dts/zte/zx279133-sk-d840n.dts` | 9132 节点 + conduit 子节点 | 待写 |
+
+新增 `.c` 必须自带 Makefile overlay：overlay 是 `cp -a kernel-overlays/. $KT/`，
+树侧 `drivers/net/ethernet/zte/Makefile` 会被整份覆盖，所以覆盖件必须包含树侧全部
+内容（内容已存在 `upstream-read/kernel/drivers_net_ethernet_zte_Makefile`）。
+
+### 5.2 设备树
+
+```dts
+&nppt {
+	/* 保留 NPPT 自己的 MAC 走 PON 侧：pcs-handle = <&xpcs1>、phys = <&pon_serdes> */
+	lan_cpu: ethernet-lan-cpu {
+		compatible = "zte,zx279133-lan-conduit";
+	};
+
+	switch {
+		compatible = "zte,zx279133-9132";
+		zte,mdio-handle = <&mdio0>;   /* 9132 内部 PHY 在这条总线上 */
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				ethernet = <&lan_cpu>;
+				phy-mode = "sgmii";
+			};
+			port@1 { reg = <1>; label = "lan1"; phy-mode = "internal"; };
+			port@2 { reg = <2>; label = "lan2"; phy-mode = "internal"; };
+			port@3 { reg = <3>; label = "lan3"; phy-mode = "internal"; };
+			port@4 { reg = <4>; label = "lan4"; phy-mode = "internal"; };
+		};
+	};
+};
+```
+
+注意 `&nppt` 的 `pcs-handle` 必须从 xpcs0 交还给 xpcs1：xpcs0 是 XMAC0（LAN 通道）
+的 PCS，xpcs1 才是 NPPT 自己（XMAC1）的 PCS。SR1010 的 dtsi 就是这么分的
+（`pcs-handle = <&xpcs1>` / `zte,lan-pcs-handle = <&xpcs0>`）。
+
+### 5.3 驱动要做的四件事
+
+1. **拿到资源**：父服务、`lan-serdes` PHY、`zte,lan-pcs-handle`（XPCS0）、
+   `zte,mdio-handle`（mdio0）。
+2. **把 XMAC0 拉起来**：照 `zx279133_lan_xmac_configure()` +
+   `zx279133_lan_datapath_enable()` 移植，但换成 1G SGMII/1000BASE-X
+   （厂商：`xmac 0 speed set 2 in sgmii(xmac speed 3)`；RTL8372N 那套是 10G USXGMII）。
+   mainline 侧现成的 SGMII 代码在 `zx279133-mac.c::zx279133_xmac_sgmii_init()`，
+   差别只是 XMAC 基址换成 `ZX279133_XMAC0_BASE`。
+   **未决**：mainline 的 `phy-zx279133-uni-serdes.c` 只接受 USXGMII/10GBASE-R，
+   对 SGMII 返回 `-EOPNOTSUPP`（overlay 的 DTS 注释已记下这条），
+   所以 1000BASE-X 档要么给这个 PHY 驱动补一档，要么像厂商那样完全绕开 phylink、
+   自己把 PCS 写成固定 1G。后者更接近厂商实际做法。
+3. **把 9132 芯片配好**：G2a 的属性字 + PVID（已在 np.c），G2b 的 PHY 使能（已在 np.c），
+   再加上 per-port 的隔离矩阵与 VID→口映射。
+4. **建 per-port 网口**：DSA 路线下由 tagger 承担。
+
+### 5.4 9132 侧的 VID→口映射（未决，需要逆向）
+
+这是 G2d 的关键未知量。厂商侧可查的东西：
+
+- `tm_vlan_check_ena_set(port, mode, enable)` 的真实实现与 mode 0/1 的含义；
+- `tm_port_vlan_filter_set()` 里 `pp_vlTagMsk` 的编码方式；
+- `port_pvid_table_set()` 落到 ERAM 表 `0x25`；
+- `output_vlan_check_en_table_set()` 落到 ERAM 表 `0x23`。
+
+活板侧已知：厂商 init 对 p=0..7 都调了 `tm_vlan_check_ena_set(p,0,1)` 与
+`(p,1,1)`，而活板读回来的 ingress 帧模式却是 0 —— 所以"厂商开了 VLAN 检查"和
+"活板跑成扁平桥"并不矛盾，VLAN 检查的语义需要从代码里解出来。
+
+---
+
+## 6. 本轮（run 39460558858）实际要测的东西
+
+这一轮不写新驱动，只把两个可测量的写加到 `zx279133-np.c`，用一次构建把两个未知量变成
+已知量：
+
+1. **SPA 通路是否真的通到芯片** —— 写完属性字与两个 PVID 字之后立刻读回来并打印。
+   读回值与写入值一致 ⇒ 通路正常；读回 0 或全 1 ⇒ 写根本没到芯片，后面所有端口配置
+   都不用再试。
+2. **mainline 的 MDIO 能不能摸到 9132 的内部 PHY** —— 对 mdio0 的 0x0a..0x0d 读
+   PHYSID1/2，清 BMCR 的 POWERDOWN，置 ANENABLE|ENABLE，再读 LMSR 的链路位。
+   打印每口的 PHY ID、BMCR、link。链路位为 1 ⇒ 哪个物理口插着 PC 一眼可见
+   （厂商侧对应关系：PC 插的是 sw1 = chip port 2）。
+
+预期 dmesg 形态：
+
+```
+zx279133-np 19000000.nppt: 9132 PPU 1 attribute word xxxxxxxx (VID 59)
+zx279133-np 19000000.nppt: 9132 PPU 1 PVID word 1 xxxxxxxx
+zx279133-np 19000000.nppt: 9132 PPU 1 PVID word 2 xxxxxxxx
+... 端口 2..4 同 ...
+zx279133-np 19000000.nppt: 9132 UNI ports 1..4 up (transport VIDs 59..62)
+zx279133-np 19000000.nppt: 9132 UNI PHY 0a: id xxxx:xxxx, BMCR xxxx, link 1
+```
+
+## 7. 未决项
+
+| # | 问题 | 需要什么 |
+|---|---|---|
+| 1 | 9132 能不能按 VID 把 CPU 口来的帧送到指定 UNI 口并在出口脱标 | 逆向 `tm_vlan_check_ena_set` / `tm_port_vlan_filter_set` / ERAM 表 0x23、0x25 |
+| 2 | 9132 的 per-port 隔离矩阵怎么写（D13） | 逆向 `port_set_port_isolate(p,q,x)` |
+| 3 | 厂商给每个 UNI 口用的虚拟 MAC 是怎么写进 FDB 的 | 逆向 `netdriver.ko` 的 FDB 写路径（VID 方案的替代品） |
+| 4 | `uni-phy` 里的 0x1c、0x02 是什么 | 活板继续查；或读厂商 `uni_phy` 符号 |
+| 5 | XMAC0 的 1G SGMII 档要不要给 `phy-zx279133-uni-serdes.c` 补一档 | 照厂商 U-Boot 的 `mode_eth_1gbase_x_cfg` 寄存器组做 |
+| 6 | 厂商的 `xmac0`（0x140000）与 RGMII MAC（0x15900000）的关系 | 本文件只用到"9132 的 CPU 口 = 0x140000 那一侧"，已被 `g_mii_dev_name[0] = sw` + `xmac0 is used` 交叉支持 |
+
+---
+
+## 8. 2026-10-21 这一轮：两条通道都换掉了
+
+### 8.1 run 82/83/84 挂在 Compile，原因是三个不存在的宏
+
+`2efe2d9`（G2b）之后的三轮 CI（run 82 = 39460558858、83 = 39469377776、
+84 = 39471292550）**全部死在 "Compile" 这一步**，不是超时也不是门禁。run 82 的 job
+页里 `data-conclusion="failure"` 落在 `data-name="Compile"` 上，其后的九步是
+`skipped`。真正的原因在源码里，而且是三个**内核里根本不存在的宏**：
+
+| 写错的宏 | 内核里实际是什么 |
+|---|---|
+| `BMCR_POWERDOWN` | `BMCR_PDOWN`（bit 11，`include/uapi/linux/mii.h`） |
+| `BMCR_ENABLE` | **不存在** —— 标准 BMCR 根本没有 "enable" 位；上电 = 清 PDOWN |
+| `MII_LMSR` | **不存在** —— 0x1a 是 `MII_RESV2`；链路位在 BMSR 的 `BMSR_LSTATUS`，且 BMSR 会锁存，必须读两次 |
+
+这三个名字是照厂商代码抄的（厂商的 `zte_set_gephy_enable()` 清 bit 11），不是照
+内核抄的。内核的 `BMCR_*`/`BMSR_*` 全在 `include/uapi/linux/mii.h`（`linux/mii.h`
+只做转发），`mdiobus_read()/mdiobus_write()` 声明在 **`include/linux/mdio.h`**
+——`linux/mdiobus.h` 这个文件从来就不存在。
+
+核对用的是树自己那份头文件，不是主线：
+`raw.githubusercontent.com/cnjn/linux-mainline-zte-zxslc-sr1010/96e5a2413524742e177e383fe523ef21de5ed238/include/{linux, uapi/linux}/{mii.h, mdio.h, phy.h}`。
+
+### 8.2 kexec 试跑通道死了，U-Boot RAM 引导接管
+
+run 81 之后的试跑全部没有拿到新内核的任何一行输出。串口日志把原因写得很清楚
+（`staging/ctl/serial.log` 第 515675 行附近）：
+
+```
+[  852.390925] kexec_core: Starting new kernel
+[  852.395118] Disabling non-boot CPUs ...
+[  852.496875] psci: CPU1 killed (polled 0 ms)
+[  852.530284] Bye!
+SPI NAND
+start read bootloader
+```
+
+`Bye!` 之后紧跟着的是 bootloader 自己的 "start read bootloader" —— 也就是说**这块板
+子上的 kexec 落回了一次硬件复位**，新内核一个字符都没打印。一个连 banner 都拿不到
+的通道对这一轮毫无价值：这一轮要的证据全在 dmesg 里。
+
+换掉它的通道是 **U-Boot 从 RAM 起内核**，而且这条路在这块板子上本来就跑通过
+（`staging/ctl/ubram-save.log`：`ubram: bootm 0x89000000` → 看到内核 banner →
+交出控制台）。流程是：
+
+```
+ssh root@192.168.9.1 'reboot -f'        # 回到 U-Boot
+# 串口敲键打断 autoboot，用 'bdinfo' 判定（只有 U-Boot 会答 baudrate=）
+setenv ipaddr 192.168.9.1 ; setenv serverip 192.168.9.25
+tftpboot 0x89000000 sk-d840n-initramfs.itb
+bootm 0x89000000
+```
+
+PC 侧要有一台 TFTP：`python tools/tftpsrv.py staging/trial 69`（U-Boot 的 tftpboot
+走 UDP/69，根目录必须是 kit 所在的目录，tftpboot 传的是**裸文件名**）。
+新脚本 `tools/ubtrial.sh` 把"重启→打断 autoboot→tftp→bootm→抓证据"串成一条，
+并且不写 flash：内核整轮都在 RAM 里，下一次断电就回到已装系统。
+
+### 8.3 Uni SerDes 的模式：不是我们说了算，是驱动说了算
+
+这一轮原本按"9132 的 CPU 口是 1G ⇒ lane 走 1G SGMII"来写（commit 82b01a5）。
+核对树自己的驱动后发现**同一条 lane**（XMAC0 + XPCS0 + uni_serdes）在 SR1010 上是
+**10G USXGMII**：
+
+- `drivers/net/ethernet/zte/zx279133-rtl8372n.c`：`phy_set_mode_ext(serdes,
+  PHY_MODE_ETHERNET, PHY_INTERFACE_MODE_USXGMII)`，XPCS 用
+  `ZX279133_XPCS_USXG_EN` / `ZX279133_XPCS_USXGMII_AN_BMCR 0x3140` 编程，
+  CPU 口（port 8）是 `PHY_INTERFACE_MODE_10GBASER`；
+- `phy-zx279133-uni-serdes.ko` 的 Kconfig 写的是"supports the USXGMII and 10GBASE-R
+  consumer modes"；
+- 而厂商 U-Boot 的 `userdes init_change` 帮助里 `MODE_SGMII 0`，厂商把 XMAC0 设成
+  "xmac 0 speed set 2 in sgmii" —— 这是**这块板子**上厂商自己的选择。
+
+两边都对：SR1010 的 CPU 口是 10G，本板的 9132 CPU 口是 1G。问题是 mainline 的
+uni-serdes 驱动**只接受它实现了的接口**，`set_mode(SGMII)` 很可能直接 -EOPNOTSUPP
+（这正是 DTS 注释里记的老坑）。
+
+所以驱动改成**协商**而不是硬要：先要 SGMII，被拒就退到 USXGMII，并按选中的那条
+用对应的 XPCS 序列（SGMII 用树里 `zx279133-mac.c` 的 1G 档，USXGMII 用树里
+`zx279133-rtl8372n.c` 的 10G 档），日志里明确打出拿到了哪一档。同时**证据行即使
+在 bring-up 失败时也要打印** —— 0x0090 是唯一能读到 XPCS0 状态的地方，"编程错了"
+和"根本没编程"从外面看是一样的。
+
+---
+
+## 9. 2026-10-21：主线活板第一次跑起来（RAM 引导，无刷机）
+
+用 `tools/ubtrial.sh` 把 run 78 的 initramfs FIT 从 RAM 引导起来，整条链路一次通：
+
+```
+ubtrial: kit=sk-d840n-initramfs.itb (11540268 bytes)
+ubtrial: at the U-Boot prompt at probe 1
+ubtrial: Bytes transferred = 11540268 (b0172c hex)
+ubtrial: kernel banner seen
+ubtrial: Kernel command line: console=ttyAMA0,115200n8
+```
+
+内核从第一条指令起就在串口上，`/init`、procd、ubus 全部起来，
+`trial: netdevs= br-lan eth0 lo addr=192.168.9.1/24`。
+
+### 9.1 三条取证通道的现状
+
+| 通道 | 状态 | 依据 |
+|---|---|---|
+| ramoops/pstore | **作废** | 厂商 4.19 自己也在 0x9c000000 写 pstore，会盖掉主线的记录 |
+| 串口日志 | **可用** | 常驻 `tools/serrelay.ps1` 独占 COM3，全程记录；19.6 MB |
+| 串口控制台（对活板下命令） | **可用** | 新脚本 `tools/concmd.sh`：往 `sercmd.txt` 写命令，从 `serial.log` 取回输出 |
+
+`tools/concmd.sh` 是这轮新写的。**主线活板只能从串口驱动**：它的 eth0 是 NPPT
+自己的 MAC（XMAC1 / pon_serdes 一侧），而 PC 插在 9132 的 UNI 口上，主线还没有
+驱动那条 lane，所以 `ping 192.168.9.1` 不通，SSH 也就无从谈起。
+
+### 9.2 RAM 环境已经具备刷机条件（G4 的前置）
+
+在活板上直接读到的：
+
+```
+dev:    size   erasesize  name
+mtd1: 00200000 00020000 "boot"
+mtd2: 00800000 00020000 "kernel"
+mtd3: 00100000 00020000 "dtb"
+mtd4: 00400000 00020000 "parameter tags"
+mtd5: 0f000000 00020000 "root"
+mtd6: 00100000 00020000 "scratch"
+```
+
+- **root = mtd5**，起始 0xf00000 —— 与厂商 U-Boot 的 `root=/dev/mtdblock5` 一致，
+  也与板级 DTS 里 `mtd5 = &rootpart` 的别名一致；
+- `/dev/mtd1..6` 都是可写字符设备，`/dev/mtdblock1..6` 都在；
+- `/usr/sbin/zrec`、`/usr/sbin/zrec-run`、`/www/zrec` **都在** —— 恢复刷写服务
+  已经编进 initramfs，而 flash 模式的镜像里它必须不存在（CI 有门禁查这件事）。
+
+所以 G4 的形态已经清楚：**从 RAM 环境刷 flash**，刷完断电重启，让板子按
+U-Boot 的 `bootcmd`（kernel/dtb/root 三个分区）从 flash 起来。
+
+### 9.3 一个必须记下来的分工
+
+厂商系统里 **eth0 就是 9132 的 CPU 口**（`g_mii_dev_name[0] = "sw"`），所以厂商
+的 eth0 能和 PC 通；主线里 eth0 是 NPPT 自己的 MAC，而**树里那个 conduit netdev
+才对应厂商的 eth0**，名字是 `lan-cpu0`（`zx279133-lan-conduit.c`:
+`strscpy(ndev->name, "lan-cpu%d", IFNAMSIZ)`）。
+
+也就是说：主线要接上 PC，靠的是 `lan-cpu0` 这条 XMAC0 lane；G3 的网络配置
+（lan 挂 `lan-cpu0`、wan 留在 eth0）要等这条 lane 通了才能定。
+
+### 9.4 G2d 的可复用面
+
+树里 `zx279133-rtl8372n.c`（SR1010 的外接交换芯片）已经示范了完整的 DSA 用法：
+CPU 口 + 4 个用户口 + 每个口一份 VLAN/隔离表 + 树自带的
+`DSA_TAG_PROTO_ZX279133_RTL8372N` 传输标签。
+
+9132 这一侧不同的地方只有一处：**VID→目的口的定向要由 9132 自己的表做**。
+而主线 `zx279133_9132_port_init()` 已经在写 9132 的端口属性字与两个 PVID 字，
+传输 VID 是 59..62（`ZX279133_LAN_TRANSPORT_VID_MIN`）。所以 G2d 缺的不是
+"怎么把帧送到某个口"，而是**在 conduit 之上挂一个 9132 的 DSA switch 驱动**，
+让树的标签器把 DSA 端口号编码成传输 VID。
+
+

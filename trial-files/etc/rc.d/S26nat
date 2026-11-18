@@ -1,0 +1,733 @@
+#!/bin/sh
+# Trial-only: turn the RAM-booted mainline system into a lab router.
+#
+# It runs as S26nat, i.e. after the image's own network init (S20network)
+# and after the recovery service's own init (S21zrec), because everything it
+# does needs the network to be up first: the DSA user ports are only bridged
+# once netifd has run, and the WAN only takes a lease once it is up.  The
+# diagnostic script S15trial runs before that and puts 192.168.9.1 on every
+# netdev it can see; that is what makes the board reachable early, and it is
+# undone here, because a static address on the WAN never gets a lease and the
+# same address on the bridge and on a bridge port is two answers to one ARP.
+#
+#   * LAN  = br-lan, which the image's own config builds from the DSA user
+#            ports that are not the WAN.  It carries 192.168.9.0/24 and the
+#            bench address 192.168.9.1.
+#   * WAN  = one DSA user port, out of the bridge, taking a DHCP lease from
+#            whatever is upstream.
+#   * dnsmasq serves the LAN: a DHCP lease for the clients and DNS
+#     forwarding to the upstream the WAN lease named.
+#   * forwarding is on and the WAN side is masqueraded, so a client on the
+#     LAN can reach the upstream.
+#   * everything that proves it - addresses, routes, the NAT ruleset and its
+#     counters - is printed into kmsg, which is where the rest of this
+#     round's evidence lives.
+#
+# WHICH JACK IS THE WAN
+#
+# The board has four RJ45 and one of them is the test PC's; the other three
+# are the places the upstream cable could be, and nothing on this bench says
+# which physical jack is which DSA port - the panel order was never
+# established, and the owner should not have to stand at the box and count.
+# So the WAN is found, not declared:
+#
+#   1. the port the PC is in is found from the bridge's forwarding database
+#      (the PC's MAC is the only learned address there), so it is never
+#      taken for the WAN;
+#   2. the default WAN (lan3) is tried first - it is out of the bridge
+#      already, so a DHCP request from it cannot be answered by our own
+#      dnsmasq;
+#   3. the remaining free ports are then tried one at a time: each is taken
+#      out of the bridge for the length of one DHCP attempt, which also makes
+#      it a WAN-typed port in the NPPT (the DSA bridge callback does that),
+#      and put back if nobody answers;
+#   4. a port that does answer becomes the WAN in the configuration as well,
+#      so the image's own network service owns the lease from then on.
+#
+# If nothing answers - which is the state of this bench while no upstream
+# cable is plugged in - the default stays and a watcher repeats the search,
+# so a cable that is plugged in later is picked up without touching the
+# board.
+#
+# Nothing here writes flash.  It is a trial script and it only configures
+# the running system.
+LAN=""
+WAN=""
+BR=""
+PC_PORT=""
+SELF=192.168.9.1
+
+# netifd builds the bridge a moment after the network init returns.
+i=0
+while [ $i -lt 30 ]; do
+	[ -e /sys/class/net/br-lan ] && break
+	i=$((i + 1))
+	sleep 1
+done
+
+# The bridge the image's own config made, if any.
+if [ -e /sys/class/net/br-lan ]; then
+	BR="br-lan"
+	LAN="br-lan"
+fi
+
+dsa_ports() {
+	for d in lan0 lan1 lan2 lan3 lan4; do
+		[ -e "/sys/class/net/$d" ] && echo "$d"
+	done
+}
+
+in_bridge() {
+	# The kernel names the link "master" (the old "bridge" link is gone),
+	# and a port that is out of the bridge has neither.
+	[ -e "/sys/class/net/$1/master" ] || [ -e "/sys/class/net/$1/bridge" ]
+}
+
+# The device name of a bridge port number.  The bridge's forwarding
+# database speaks in the bridge's own numbers, and the kernel states the
+# mapping itself every time a port joins or leaves the bridge:
+# "br-lan: port 1(lan1) entered forwarding state".  The number belongs to
+# the port and survives its leaving and coming back.
+dev_of_port() {
+	p=$1
+	d=""
+	for n in $(dmesg 2>/dev/null |
+		sed -n "s/.*br-lan: port $p(\([^)]*\)).*/\1/p"); do
+		# Only a member of the bridge is of any use: the CPU port
+		# carries a number of its own and is not one of them.
+		[ -e "/sys/class/net/br-lan/brif/$n" ] || continue
+		# The last one wins: the kernel numbers the ports again every
+		# time the bridge is rebuilt, and the old numbering is still in
+		# the log.
+		d="$n"
+	done
+	if [ -z "$d" ] && [ -e "/sys/class/net/lan$p" ]; then
+		d="lan$p"
+	fi
+	echo "$d"
+}
+
+has_addr() {
+	ip addr show dev "$1" 2>/dev/null | grep -q 'inet '
+}
+
+# The port the test PC is in.  Its MAC is the only address the bridge has
+# learned, and the bridge's forwarding database says which port learned it.
+# When it cannot be read, the measured value is used: the PC is in the
+# PHY 0x0b port, which is DSA port 5, which is lan2.
+find_pc_port() {
+	if command -v brctl >/dev/null 2>&1; then
+		# This image's brctl showmacs prints "port no  mac addr  is
+		# local?  ageing timer", so the port number is the FIRST
+		# field of a row whose SECOND field is a MAC address - and
+		# the port number is not a device name, it is the bridge's
+		# own number.
+		p=$(brctl showmacs br-lan 2>/dev/null |
+			awk '$2 ~ /^[0-9a-fA-F][0-9a-fA-F]:/ {print $1; exit}')
+		if [ -n "$p" ]; then
+			d=$(dev_of_port "$p")
+			if [ -n "$d" ]; then
+				echo "$d"
+				return 0
+			fi
+		fi
+	fi
+	echo "lan2"
+}
+
+# One DHCP attempt on a port that is out of the bridge.  The script only
+# records the offer; it applies nothing, because the offer must not touch
+# the running system - the winner is handed to the image's own network
+# service instead.
+probe_lease() {
+	p=$1
+	rm -f "/tmp/probe-$p.txt"
+	ip link set "$p" up 2>/dev/null
+	# No -T here: in this image's client - busybox's udhcpc - -T is the
+	# delay before reconnecting after a lease expires, not a per-attempt
+	# timeout.  -n exits when no lease arrives, so two discover packets
+	# are enough to answer "is anything there".
+	udhcpc -i "$p" -n -q -t 2 -s /tmp/probe-script.sh >"/tmp/probe-$p.log" 2>&1
+	[ -s "/tmp/probe-$p.txt" ]
+}
+
+cat > /tmp/probe-script.sh <<'EOF'
+#!/bin/sh
+[ "$1" = bound ] || exit 0
+echo "$siaddr $ip" >> "/tmp/probe-$interface.txt"
+exit 0
+EOF
+chmod 755 /tmp/probe-script.sh
+
+# The lease script that applies what it is given: the address, the default
+# route and the upstream resolver.  udhcpc's default script is not in this
+# image, and without one a lease is announced and then thrown away.
+cat > /tmp/udhcpc-trial.sh <<'EOF'
+#!/bin/sh
+# The lease, applied in whichever convention this client uses.
+#
+# This image has no udhcpc package of its own: the client is busybox's, and
+# busybox's udhcpc calls the script ONCE, with $1 = "bound" (or "renew" or
+# "deconfig"), and hands the whole lease over in the environment:
+# $ip, $subnet, $router, $dns, $interface, $broadcast.
+#
+# Two things about it are easy to get wrong, and both were wrong here:
+#
+#   * it does not call the script once per option.  There is no $2 naming
+#     the option - that is the OTHER convention, the standalone udhcpc's -
+#     so a script written for it ("case $2 in ip)") does nothing at all
+#     under busybox, and "nothing happens" looks exactly like "there is no
+#     network out there".
+#   * it does not export "mask", and what it exports as $subnet is the
+#     NETMASK (255.255.255.0), not a network address.  The board's own
+#     busybox says so in its default script:
+#         ip addr add $ip/${subnet:-255.255.255.0} ... dev $interface
+#
+# The other convention is accepted as well, because a script that only
+# understands one of them fails silently on the other.
+#
+# The prefix length is worked out from whatever the client exports: a
+# prefix length, a netmask, or a network address are all accepted.
+pfx_of() {
+	case "$1" in
+	'') echo 24 ;;
+	*[!0-9.]*) echo 24 ;;
+	*.*)
+		case "$1" in
+		255.255.255.*) echo 24 ;;
+		255.255.*.*) echo 16 ;;
+		255.*.*.*) echo 8 ;;
+		*) echo "$1" | awk -F. '{n=0; for (i=4;i>=1;i--) { if ($i=="0") n++; else break } p=8*(4-n); if (p<=0) p=24; print p}' ;;
+		esac ;;
+	*) echo "$1" ;;
+	esac
+}
+
+first_of() {
+	# A client may hand over a list ("gw1 gw2"); the first one is used.
+	set -- $1
+	echo "$1"
+}
+
+if [ -z "$2" ]; then
+	# busybox's convention: one call for the whole lease.
+	case "$1" in
+	bound|renew)
+		[ -n "$ip" ] || exit 0
+		pfx=$(pfx_of "${mask:-}")
+		[ -n "$pfx" ] || pfx=$(pfx_of "$subnet")
+		ip addr replace "$ip/$pfx" dev "$interface" 2>/dev/null
+		gw=$(first_of "$router")
+		[ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && \
+			ip route replace default via "$gw" dev "$interface" 2>/dev/null
+		[ -n "$dns" ] && echo "$dns" | tr ' ' '\n' > /etc/resolv.conf 2>/dev/null
+		;;
+	deconfig)
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		;;
+	esac
+	exit 0
+fi
+
+# The standalone udhcpc's convention: one call per option.
+case "$2" in
+ip)
+	pfx=$(pfx_of "${mask:-}")
+	[ -n "$pfx" ] || pfx=$(pfx_of "$subnet")
+	ip addr replace "$ip/$pfx" dev "$interface" 2>/dev/null
+	;;
+subnet)
+	# The connected route comes with the address above.  A "subnet" line
+	# that carries a netmask is not a route at all, so it is dropped
+	# rather than turned into one.
+	;;
+router)
+	gw=$(first_of "$router")
+	[ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && \
+		ip route replace default via "$gw" dev "$interface" 2>/dev/null
+	;;
+dns)
+		[ -n "$dns" ] && echo "$dns" | tr ' ' '\n' > /etc/resolv.conf 2>/dev/null
+	;;
+esac
+exit 0
+
+EOF
+chmod 755 /tmp/udhcpc-trial.sh
+
+if [ -n "$BR" ]; then
+	PC_PORT=$(find_pc_port)
+	echo "trial: nat: br-lan is up; the test PC is in $PC_PORT" >/dev/kmsg
+fi
+
+# What the bridge and the DSA ports look like, on the console.
+#
+# This is printed on purpose and not only because it is useful: everything
+# else in this project reads the board over ssh, and ssh needs the LAN to
+# work - so when the LAN does not work, the console is the only witness
+# there is.  A run that fails at the bridge must still say what the bridge
+# and the ports did.
+say_link() {
+	echo "trial: link: $* " >/dev/kmsg
+}
+for n in $(ls /sys/class/net 2>/dev/null); do
+	[ "$n" = lo ] && continue
+	carrier=$(cat "/sys/class/net/$n/carrier" 2>/dev/null)
+	oper=$(cat "/sys/class/net/$n/operstate" 2>/dev/null)
+	flags=$(cat "/sys/class/net/$n/flags" 2>/dev/null)
+	rx=$(cat "/sys/class/net/$n/statistics/rx_packets" 2>/dev/null)
+	tx=$(cat "/sys/class/net/$n/statistics/tx_packets" 2>/dev/null)
+	br=$(ls "/sys/class/net/$n/brif" 2>/dev/null | tr '\n' ',')
+	slave=$(ls "/sys/class/net/$n/brport" 2>/dev/null | tr '\n' ',')
+	say_link "$n oper=$oper carrier=$carrier flags=$flags rx=$rx tx=$tx brif=$br brport=$slave"
+done
+if [ -n "$BR" ] && [ -d "/sys/class/net/$BR/brif" ]; then
+	for p in $(ls "/sys/class/net/$BR/brif" 2>/dev/null); do
+		state=$(cat "/sys/class/net/$BR/brif/$p/state" 2>/dev/null)
+		say_link "br-lan port $p state=$state"
+	done
+fi
+say_link "addr: $(ip -o -4 addr show 2>/dev/null | tr '\n' ' ')"
+say_link "route: $(ip route show 2>/dev/null | tr '\n' ' ')"
+
+# A forced upstream.  /etc/labwan names the port that is to be the WAN, and
+# "pc" means "the port the test PC is in".  This is the mode the bench needs
+# while it has only one cable: the PC is then the upstream (it runs a DHCP
+# server and a NAT of its own), the board's WAN is the port the PC is in, and
+# the LAN keeps the other jacks.  The port leaves the bridge here, which is
+# also what makes the DSA bridge callback treat it as a WAN-typed port in the
+# NPPT.
+FORCED=""
+if [ -f /etc/labwan ]; then
+	FORCED=$(head -n 1 /etc/labwan 2>/dev/null | tr -d '\r\n ')
+fi
+
+# The ports that must never be taken for the WAN, and the switch that turns
+# the upstream search off altogether.
+#
+# /etc/labnowan holds "off" to stop the search and the watcher completely -
+# the bench uses that when a device on one of the jacks answers DHCP and the
+# search would take that jack for the WAN - or a list of port names that are
+# not to be taken for the WAN.  On 2026-10-29 the watcher took the port with
+# the ONT behind it, wrote a LAN device list of "lan1 lan2 lan3 lan-cpu0"
+# into the configuration and left the board with no bridge at all.
+NO_WAN=""
+SKIP_WAN=0
+if [ -f /etc/labnowan ]; then
+	# The value is the first line that is neither a comment nor empty.
+	# Reading the first line of the file took the comment header for the
+	# value, so "off" was never seen and the watcher ran anyway - and the
+	# watcher is the thing that takes the jack with the ONT behind it.
+	# (Measured on 2026-10-29 21:52: the watcher was running, and the
+	# kernel log said "the test PC is in lan4" - lan4 is where the ONT
+	# is.)
+	NO_WAN=$(grep -v '^[[:space:]]*#' /etc/labnowan 2>/dev/null |
+		grep -v '^[[:space:]]*$' | head -n 1 | tr -d '\r\n ')
+	[ "$NO_WAN" = "off" ] && SKIP_WAN=1
+fi
+
+# S15trial put 192.168.9.1 on everything.  Keep it on the LAN only.
+for d in /sys/class/net/*; do
+	[ -d "$d" ] || continue
+	n=${d#/sys/class/net/}
+	[ "$n" = lo ] && continue
+	[ "$n" = "$LAN" ] && continue
+	ip addr flush dev "$n" 2>/dev/null
+done
+if [ -n "$LAN" ]; then
+	ip link set "$LAN" up 2>/dev/null
+	ip addr replace $SELF/24 dev "$LAN" 2>/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# The search for the upstream.
+#
+# The default WAN is lan3: the image's own configuration already keeps it
+# out of the bridge and gives it a DHCP lease, so there is nothing to do
+# when the upstream is there.  Only when that lease does not arrive are the
+# other free ports tried.
+# ---------------------------------------------------------------------------
+default_wan="lan3"
+
+# Hand a port to the image's own network service: it becomes the WAN in the
+# configuration, the LAN is rebuilt without it, and the reload starts the
+# network service's DHCP client on it.
+adopt_wan() {
+	p=$1
+	lan_list=""
+	for q in $(dsa_ports); do
+		[ "$q" = "$p" ] && continue
+		lan_list="$lan_list${lan_list:+ }$q"
+	done
+	# The DSA CPU port stays in the bridge: it is the way in and out of
+	# the switch for the router's own traffic, and a bridge without it
+	# forwards between the jacks and never reaches the host.  It is not
+	# one of dsa_ports(), because it is not a jack and is never a WAN
+	# candidate.
+	[ -e /sys/class/net/lan-cpu0 ] && \
+		lan_list="$lan_list${lan_list:+ }lan-cpu0"
+	# The image writes its own configuration in whatever format it uses,
+	# and this one writes it as JSON: /lib/functions/uci-defaults.sh in
+	# this image is built on json_select_object, and the generated
+	# /etc/config/network is a JSON object with a "ports" array.  Rewriting
+	# that file with "uci set" is not guaranteed to be accepted, so the
+	# image's own helpers are used first - they are what wrote the file in
+	# the first place - and uci is only the fallback.
+	if [ -f /lib/functions/uci-defaults.sh ]; then
+		(
+			. /lib/functions/uci-defaults.sh
+			board_config_update
+			ucidef_set_interface "lan" device "$lan_list" protocol static \
+				ipaddr "$SELF" netmask 255.255.255.0
+			ucidef_set_interface "wan" device "$p" protocol dhcp
+			board_config_flush
+		) >/dev/kmsg 2>&1
+	fi
+	if command -v uci >/dev/null 2>&1; then
+		# Only the port list is written.  The LAN's device is the
+		# bridge itself, and this image's /etc/config/network is in the
+		# json form that "uci set" does not write - a device of
+		# "lan1 lan2 lan3 lan-cpu0" is not a device, and a network
+		# service that reads it builds no bridge at all.  That is what
+		# the watcher did on 2026-10-29, and the board was left with no
+		# bridge and no LAN.
+		uci -q get network.lan.ports >/dev/null 2>&1 && \
+			uci set network.lan.ports="$lan_list" 2>/dev/null
+		uci set network.wan.device="$p" 2>/dev/null
+		uci commit network 2>/dev/null
+	fi
+	/etc/init.d/network reload >/dev/kmsg 2>&1
+	# The reload rebuilds the bridge from the configuration, so the port
+	# that is to be the WAN has to be out of it afterwards, whatever the
+	# configuration ended up saying.
+	ip link set "$p" nomaster 2>/dev/null
+	ip link set "$p" up 2>/dev/null
+	# What the configuration actually says, read back.
+	#
+	# The image's own helpers (ucidef_set_interface) APPEND to a list that
+	# is already there: the lan ports are written as a JSON array, and
+	# json_add_string adds to the array json_select_array selected rather
+	# than replacing it.  So a second call can leave the lan with six
+	# ports instead of three - the old ones and the new ones - and the
+	# board would still work, because the port that has to leave the
+	# bridge is taken out of it right here, but the configuration would
+	# be a lie.  It is printed so that the round's evidence says which of
+	# the two it was.
+	echo "trial: nat: the configuration now says:" >/dev/kmsg
+	cat /etc/config/network >/dev/kmsg 2>&1
+	echo "trial: nat: the WAN is now $p (lan is $lan_list)" >/dev/kmsg
+	echo "trial: nat: the configuration says wan=$(uci -q get network.wan.device 2>/dev/null)" >/dev/kmsg
+	echo "trial: nat: the bridge says $(brctl show 2>/dev/null | tr '\n' ' ')" >/dev/kmsg
+}
+
+search_others() {
+	for p in lan1 lan4 lan2; do
+		[ -e "/sys/class/net/$p" ] || continue
+		[ "$p" = "$PC_PORT" ] && continue
+		# A port that is not in the bridge needs no moving; one that is
+		# comes out for the length of the attempt, which also turns it
+		# into a WAN-typed port in the NPPT.
+		was=0
+		in_bridge "$p" && was=1
+		[ "$was" = 1 ] && ip link set "$p" nomaster 2>/dev/null
+		if probe_lease "$p"; then
+			echo "trial: nat: $p answered DHCP - it is the upstream" >/dev/kmsg
+			cat "/tmp/probe-$p.txt" >/dev/kmsg 2>&1
+			adopt_wan "$p"
+			return 0
+		fi
+		[ "$was" = 1 ] && ip link set "$p" master br-lan 2>/dev/null
+	done
+	return 1
+}
+
+WAN=""
+if [ -n "$BR" ] && [ "$SKIP_WAN" = 0 ]; then
+	if [ -n "$FORCED" ]; then
+		case "$FORCED" in
+		pc) FORCED="$PC_PORT" ;;
+		lan1|lan2|lan3|lan4) ;;
+		*) FORCED="" ;;
+		esac
+	fi
+	if [ -n "$FORCED" ]; then
+		WAN="$FORCED"
+		# The resolved port is written down, because the watcher cannot
+		# work it out for itself once the port has left the bridge: the
+		# bridge's forwarding database is where the port was found, and
+		# the port is no longer in the bridge by then.
+		echo "$WAN" > /tmp/labwan.port
+		echo "trial: nat: the upstream is forced onto $WAN" >/dev/kmsg
+		# The port leaves the bridge and that is all that is needed for
+		# the forced case.  The configuration is deliberately NOT
+		# rewritten here: the image's own helpers APPEND to a list that
+		# is already there (the lan ports are a JSON array, and
+		# json_add_string adds to the array json_select_array selected
+		# rather than replacing it), so a second call can leave the lan
+		# with six ports instead of three - and a bridge setup that
+		# names the same port twice is one this image's network service
+		# may refuse.  The forced case needs three things and can have
+		# all three at runtime: the port out of the bridge, an address
+		# on it, and a DHCP server on the LAN.
+		#
+		# Out of the bridge first, so the DSA bridge callback sees the
+		# port leave - that is what tells the NPPT the port is a routed
+		# one - and then up, so the client on it has a carrier.
+		ip link set "$WAN" nomaster 2>/dev/null
+		ip link set "$WAN" up 2>/dev/null
+		echo "trial: nat: the bridge says $(brctl show 2>/dev/null | tr '\n' ' ')" >/dev/kmsg
+	else
+	# Give the default WAN its chance: the network service's own client is
+	# already running on it.
+	i=0
+	while [ $i -lt 24 ]; do
+		if has_addr "$default_wan"; then
+			WAN="$default_wan"
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	if [ -n "$WAN" ]; then
+		echo "trial: nat: the default WAN $WAN took a lease" >/dev/kmsg
+	else
+		echo "trial: nat: no lease on $default_wan; looking for the upstream" >/dev/kmsg
+		search_others || true
+		WAN="$default_wan"
+		# The search may have handed another port to the network
+		# service; then that one is the WAN.
+		for p in lan1 lan4 lan2; do
+			[ -e "/sys/class/net/$p" ] || continue
+			[ "$p" = "$PC_PORT" ] && continue
+			uci -q get network.wan.device 2>/dev/null | grep -q "^$p\$" && WAN="$p"
+		done
+	fi
+	fi
+fi
+
+# The image's own network service owns the lease on the WAN port.  When it
+# has one, nothing is done here.  When it does not - which is the state of
+# this bench while no upstream cable is plugged in - a client of our own
+# keeps trying on that port, so the board answers the moment the cable
+# appears.
+if [ -n "$WAN" ]; then
+	ip link set "$WAN" up 2>/dev/null
+	i=0
+	while [ $i -lt 10 ]; do
+		has_addr "$WAN" && break
+		i=$((i + 1))
+		sleep 1
+	done
+	if ! has_addr "$WAN"; then
+		# A client of our own runs on the WAN whatever the image's own
+		# network service does with it, for two reasons: the forced
+		# upstream is handed over with a uci rewrite, and this image's
+		# /etc/config/network is written in the json form that the
+		# uci library does not always accept a rewrite of; and a lease
+		# from the same server is the same lease, so a second client
+		# cannot fight the first one for the address - it replaces the
+		# same address with the same address.
+		if command -v udhcpc >/dev/null 2>&1; then
+			echo "trial: nat: udhcpc on $WAN" >/dev/kmsg
+			# No -t and no -T here: this image's udhcpc is busybox's,
+			# where -t is the number of discover packets and -T is the
+			# delay before reconnecting after a lease expires - neither
+			# is a per-attempt timeout, and -t 0 is not "try forever"
+			# the way it looks.  With neither, busybox's client keeps
+			# discovering, which is what a WAN needs.
+			# setsid, for the same reason as dnsmasq's: this script is
+			# about to end, and a background child that is still
+			# attached to this shell's session is killed with it.
+			# setsid puts the child in a session of its own, which
+			# is what nohup was standing in for - and nohup is not
+			# in this image: the busybox here has no nohup applet,
+			# so "nohup ..." failed with "not found" and neither
+			# the DHCP client nor the DHCP server ever started.
+			setsid udhcpc -i "$WAN" -f -s /tmp/udhcpc-trial.sh \
+				>"/tmp/udhcpc-$WAN.log" 2>&1 &
+		else
+			echo "trial: nat: no udhcpc in this image" >/dev/kmsg
+		fi
+	fi
+fi
+
+# The LAN side's DHCP server and resolver.  dnsmasq is the one the image
+# ships; if it is not there, the LAN still has an address and the board is
+# still reachable.
+if command -v dnsmasq >/dev/null 2>&1; then
+	killall dnsmasq 2>/dev/null
+	sleep 1
+	cat > /tmp/dnsmasq-trial.conf <<EOF
+interface=$LAN
+dhcp-range=192.168.9.100,192.168.9.200,255.255.255.0,12h
+dhcp-option=3,192.168.9.1
+dhcp-option=6,192.168.9.1
+dhcp-leasefile=/tmp/dnsmasq.leases
+pid-file=/tmp/dnsmasq.pid
+EOF
+	# setsid: this script is run by the init system, and a background child
+	# that is still attached to this shell's session is killed when the
+	# script ends - which is the moment the DHCP server has to survive.
+	# setsid gives the child a session of its own.  nohup would have done
+	# the same, and is not in this image: the busybox here has no nohup
+	# applet, so the server never started at all.
+	setsid dnsmasq -C /tmp/dnsmasq-trial.conf >/dev/kmsg 2>&1 &
+	sleep 2
+	echo "trial: nat: dnsmasq serving $LAN" >/dev/kmsg
+	if [ -s /tmp/dnsmasq.leases ]; then
+		echo "trial: nat: dnsmasq wrote a lease file" >/dev/kmsg
+	else
+		echo "trial: nat: dnsmasq wrote no lease file yet" >/dev/kmsg
+	fi
+else
+	echo "trial: nat: no dnsmasq in this image" >/dev/kmsg
+fi
+
+# Forwarding and the NAT.  nftables is what mainline's fw4 uses, and the
+# plan asks for its counters, so nft is preferred; iptables is the fallback
+# when the image has no nft.
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+if [ -n "$WAN" ] && command -v nft >/dev/null 2>&1; then
+	# "counter" before "masquerade", not after: masquerade is a terminal
+	# statement, and nft rejects anything that follows it ("Statement after
+	# terminal statement has no effect"), so the rule as it was written
+	# never loaded and the WAN side was never masqueraded.
+	nft -f - >/dev/kmsg 2>&1 <<EOF
+table ip nat {
+	chain postrouting {
+		type nat hook postrouting priority 100; policy accept;
+		oifname "$WAN" counter masquerade
+	}
+}
+EOF
+	echo "trial: nat: nft masquerade on $WAN" >/dev/kmsg
+elif [ -n "$WAN" ] && command -v iptables >/dev/null 2>&1; then
+	iptables -t nat -A POSTROUTING -o "$WAN" -j MASQUERADE 2>/dev/null
+	echo "trial: nat: iptables masquerade on $WAN" >/dev/kmsg
+else
+	echo "trial: nat: neither nft nor iptables in this image" >/dev/kmsg
+fi
+
+# The proof, in one place.
+{
+	echo "trial: nat evidence"
+	echo "pc port: $PC_PORT"
+	ip addr 2>/dev/null
+	echo "--- routes ---"
+	ip route 2>/dev/null
+	echo "--- forwarding ---"
+	cat /proc/sys/net/ipv4/ip_forward 2>/dev/null
+	echo "--- bridge ---"
+	brctl show 2>/dev/null
+	echo "--- conntrack ---"
+	head -n 20 /proc/net/nf_conntrack 2>/dev/null
+	echo "--- wan counters ---"
+	[ -n "$WAN" ] && ip -s link show "$WAN" 2>/dev/null
+	if command -v nft >/dev/null 2>&1; then
+		echo "--- nft ruleset ---"
+		nft list ruleset 2>/dev/null
+		echo "--- nft counters ---"
+		nft list chain ip nat postrouting 2>/dev/null
+	fi
+	if command -v iptables >/dev/null 2>&1; then
+		echo "--- iptables nat ---"
+		iptables -t nat -L -n -v 2>/dev/null
+	fi
+	echo "--- neighbours ---"
+	ip neigh 2>/dev/null
+	echo "--- resolv.conf ---"
+	cat /etc/resolv.conf 2>/dev/null
+	echo "trial: nat evidence end"
+} >/dev/kmsg 2>&1
+
+# The bench's state is "no upstream cable yet", so the search has to keep
+# running: a cable that is plugged in after this script has run has to be
+# picked up without anybody touching the board.
+if [ -n "$BR" ] && [ "$SKIP_WAN" = 0 ]; then
+	cat > /tmp/trial-nat-watch.sh <<'EOF'
+#!/bin/sh
+# Two jobs, once a minute:
+#
+#   1. keep the WAN port out of the bridge.  A bridge port cannot hold an
+#      IP address - the kernel answers "device or resource busy" - so if
+#      the port that is to be the WAN comes back into the bridge (the
+#      network service rebuilds it from the configuration whenever
+#      something makes it reload), the WAN cannot take an address at all
+#      and the round fails with no reason on the wire.
+#   2. look for an upstream on the other ports, and hand it over when one
+#      answers.
+PC=lan2
+WAN=""
+[ -f /etc/labwan ] && WAN=$(head -n 1 /etc/labwan 2>/dev/null | tr -d '\r\n ')
+# "pc" is a name for the port the test PC is in, not a port name, and it has
+# to become one before it can be used.  The port the PC is in is found in the
+# bridge's forwarding database - the PC's MAC is the only address it has
+# learned - and once the port has left the bridge that record is gone, so the
+# port the router script resolved is written down and read here.
+if [ -s /tmp/labwan.port ]; then
+	WAN=$(head -n 1 /tmp/labwan.port 2>/dev/null | tr -d '\r\n ')
+else
+	case "$WAN" in
+	pc)
+		if command -v brctl >/dev/null 2>&1; then
+			p=$(brctl showmacs br-lan 2>/dev/null |
+				awk '$2 ~ /^[0-9a-fA-F][0-9a-fA-F]:/ {print $1; exit}')
+			[ -n "$p" ] && WAN=$(dev_of_port "$p")
+		fi
+		;;
+	lan1|lan2|lan3|lan4) ;;
+	*) WAN="" ;;
+	esac
+fi
+echo "trial: nat: the watcher has the upstream on ${WAN:-none}" >/dev/kmsg
+while true; do
+	sleep 60
+	if [ -n "$WAN" ]; then
+		[ -e "/sys/class/net/$WAN" ] || continue
+		if [ -e "/sys/class/net/$WAN/bridge" ]; then
+			ip link set "$WAN" nomaster 2>/dev/null
+			ip link set "$WAN" up 2>/dev/null
+			echo "trial: nat: the watcher took $WAN out of the bridge again" >/dev/kmsg
+		fi
+		continue
+	fi
+	for p in lan3 lan1 lan4 lan2; do
+		[ -e "/sys/class/net/$p" ] || continue
+		[ "$p" = "$PC" ] && continue
+		# A port the bench has named is never taken for the WAN: the ONT
+		# behind it answers DHCP, and taking that jack for the WAN took
+		# the bridge down with it on 2026-10-29.
+		case " $NO_WAN " in *" $p "*) continue ;; esac
+		ip addr show dev "$p" 2>/dev/null | grep -q 'inet ' && continue
+		was=0
+		[ -e "/sys/class/net/$p/bridge" ] && was=1
+		[ "$was" = 1 ] && ip link set "$p" nomaster 2>/dev/null
+		if udhcpc -i "$p" -n -q -t 2 -s /tmp/probe-script.sh >/dev/null 2>&1; then
+			echo "trial: nat: the watcher found an upstream on $p" >/dev/kmsg
+			# The upstream is taken at runtime only.  The configuration
+			# is NOT rewritten: this image's /etc/config/network is in
+			# the json form that "uci set" does not write, and a rewrite
+			# of it left the network service with a LAN it could not
+			# build - the bridge went down with it.  The port leaves the
+			# bridge and a client of our own takes the lease on it, which
+			# is what the forced case does as well.
+			ip link set "$p" nomaster 2>/dev/null
+			ip link set "$p" up 2>/dev/null
+			echo "$p" > /tmp/labwan.port
+			WAN="$p"
+			if command -v udhcpc >/dev/null 2>&1; then
+				setsid udhcpc -i "$p" -f -s /tmp/udhcpc-trial.sh \
+					>"/tmp/udhcpc-$p.log" 2>&1 &
+			fi
+			break
+		fi
+		[ "$was" = 1 ] && ip link set "$p" master br-lan 2>/dev/null
+	done
+done
+EOF
+	chmod 755 /tmp/trial-nat-watch.sh
+	/tmp/trial-nat-watch.sh >/dev/kmsg 2>&1 &
+	echo "trial: nat: the watcher is running (it keeps the WAN port out of the bridge and looks for an upstream)" >/dev/kmsg
+fi
+
+exit 0

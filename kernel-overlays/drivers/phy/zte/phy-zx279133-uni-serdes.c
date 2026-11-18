@@ -1,0 +1,860 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * ZTE ZX279133 internal Uni SerDes PHY.
+ *
+ * The SR1010 LAN CPU uplink uses XMAC0 work mode 5: Uni SerDes mode 1
+ * (the vendor 10G Ethernet profile) followed by XPCS0 USXGMII mode 0.
+ * SK-D840N's panel jack 4 uses the same block as 1000BASE-X/SGMII, with the
+ * image measured out of that lane while it was carrying gigabit traffic.
+ * This provider owns only the internal Uni SerDes block; XMAC0/XPCS0 and
+ * the RTL8372N switch are separate consumers.
+ */
+
+#include <linux/bitfield.h>
+#include <linux/clk.h>
+#include <linux/debugfs.h>
+#include <linux/device.h>
+#include <linux/fs.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/kernel.h>
+#include <linux/kstrtox.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/phy.h>
+#include <linux/phy/phy.h>
+#include <linux/platform_device.h>
+#include <linux/printk.h>
+#include <linux/reset.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+
+#define ZX279133_UNI_SERDES_PROFILE_WORDS	49
+#define ZX279133_UNI_SERDES_MODE_CTRL		0x54
+#define ZX279133_UNI_SERDES_ENABLE		BIT(0)
+#define ZX279133_UNI_SERDES_1G_RATE		BIT(8)
+#define ZX279133_UNI_SERDES_MODE_2G5		0x00000409
+#define ZX279133_UNI_SERDES_IMAGE_WORD		0x50
+#define ZX279133_UNI_SERDES_IMAGE_MARK		0x34000003
+#define ZX279133_UNI_SERDES_SC_PLL		0xcc
+#define ZX279133_UNI_SERDES_SC_PLL_LOCK		0x7
+#define ZX279133_UNI_SERDES_PLL_STATUS		0xd0
+#define ZX279133_UNI_SERDES_PLL_LOCK		BIT(0)
+#define ZX279133_UNI_SERDES_RX_STATUS		0xe4
+#define ZX279133_UNI_SERDES_RX_LOS		BIT(0)
+#define ZX279133_UNI_SERDES_CDR_LOCK		BIT(1)
+#define ZX279133_UNI_SERDES_POLL_US		2000
+#define ZX279133_UNI_SERDES_TIMEOUT_US		2000000
+#define ZX279133_UNI_RESET_PHASE_US		4300
+#define ZX279133_UNI_RATE_DIAG_LIMIT		3
+
+struct zx279133_uni_serdes {
+	struct device *dev;
+	void __iomem *serdes;
+	struct clk_bulk_data clocks[2];
+	struct reset_control_bulk_data resets[2];
+	/* Protects the mode, powered state and clock/reset lifecycle. */
+	struct mutex lock;
+	/* The driver holds enabled clocks and may access MMIO while true. */
+	bool powered;
+	/* power_off() asks the next power_on() to rewrite the rate in place. */
+	bool rate_pending;
+	/* Bound cold-entry diagnostics even when the lane watchdog retries. */
+	unsigned int rate_diag_count;
+	int submode;
+	/* Which of the three images to write: 0 = the tree's own 1G one,
+	 * 1 = the loader's 2.5G one, 2 = the vendor's 2.5G one (see the
+	 * three arrays below).
+	 */
+	int image_sel;
+};
+
+/* Vendor uni_mode_eth_10gbase_r_cfg(), used for Uni mode 1. */
+static const u32 zx279133_uni_10g_profile[] = {
+	0xe0000004, 0x50a840a3, 0x013e8687, 0x0210c073,
+	0x00000048, 0x00000000, 0x00ff8000, 0x00238020,
+	0x80000400, 0x00020000, 0x0c633830, 0x00000e46,
+	0x00000020, 0x00002000, 0x00000000, 0x00ff0000,
+	0x05a85100, 0x00000000, 0x4f042b2a, 0x60002200,
+	0x34000003, 0x00000100, 0x00000080, 0x00000000,
+	0x200554a8, 0x67748091, 0x01000000, 0x40003b00,
+	0xa9004000, 0x10670002, 0x000000da, 0xf20000c8,
+	0x10371037, 0x01000200, 0x00020001, 0x10000000,
+	0x00084008, 0x802dc000, 0x000000ff, 0x55555500,
+	0x55555555, 0x00555555, 0x30000818, 0x40002000,
+	0x0000000c, 0x01000000, 0x00000080, 0x00010000,
+	0x00000000,
+};
+
+static_assert(ARRAY_SIZE(zx279133_uni_10g_profile) ==
+	      ZX279133_UNI_SERDES_PROFILE_WORDS);
+
+/*
+ * The image this lane actually lives in, read out of the board rather than
+ * transcribed.
+ *
+ * Provenance: 2026-10-28 05:52, the board's own U-Boot, `md 0x16100000 0x31`
+ * - 49 words - taken right after `xmac_test xmac_work_mode_set 0 2`, which
+ * printed "mode_eth_1gbase_x_cfg" and "work in 1000BASE-X mode. ret = 0".
+ *
+ * 2026-10-28 13:00, one bit corrected.  The same U-Boot window, read again
+ * after its net init (win105, staging/ctl/win105.log) and cross-checked
+ * against the vendor's own mode_eth_1gbase_x_cfg() image
+ * (devtools/np133.py image mode_eth_1gbase_x_cfg, entries 46..94), gives
+ * word 0 = 0xe0000004 - not 0xe0001004.  The vendor's image and the board's
+ * own measurement agree, and the bit 12 that was set here is in neither.
+ *
+ * That mistake was invisible to this driver's own check: it writes the
+ * array and then compares the block against the same array, so it reported
+ * "image differs in 0/49 word(s)" while the block differed from the
+ * working U-Boot by exactly that one bit.  The window now has a dump
+ * (below) so that the block can be compared with what the loader leaves
+ * behind instead of with what this file says.
+ *
+ * The two images differ in 28 of the 49 words, and 28 is the number this
+ * driver has been reporting since it started looking ("Uni SerDes 1G
+ * inherited: ... image differs in 28/49 word(s)").  The word at
+ * 0x16100054 - the mode register - reads 0x101 here and 0x01 in the other
+ * image, and the log has been saying "mode 0x101 already" all along: the
+ * board was holding the base-X image the whole time and the reference file
+ * in this driver was the wrong one.
+ *
+ * What the two images mean: the base-X one has the mode word at 0x101 and
+ * the 1.25G lane state in the registers around it; the other one (0x01, and
+ * the words this file used to carry) is what the same bootloader leaves
+ * behind when the lane is left in SGMII.  U-Boot's net init prints
+ * "mode_eth_1gbase_x_cfg" on the way in, so the bootloader configures this
+ * lane for base-X before Linux ever sees it.
+ *
+ * np_133.ko's uni_mode_eth_10gbase_r_cfg() list (zx279133_uni_10g_profile
+ * below) matches this image on 33 of the 49 words, and the older 1G list
+ * matches it on 21 - the same 21 the comment above used to quote against
+ * the wrong file.
+ */
+static const u32 zx279133_uni_1g_profile[] = {
+	0xe0000004, 0x4fa840a3, 0x013e860f, 0x0210c073,
+	0x00000048, 0x00000000, 0x0b016100, 0x00238620,
+	0x80000000, 0x00050000, 0x0c633830, 0x00000007,
+	0x00000020, 0x00002000, 0x00000000, 0x00ff0000,
+	0xc5a85100, 0x00000000, 0x01045b2a, 0x66002200,
+	0x34000003, 0x00000100, 0x00000080, 0x00000000,
+	0x200554a8, 0x00648091, 0x01000000, 0x00003700,
+	0xa9004000, 0x10640002, 0x000000da, 0xf20000c8,
+	0x10371037, 0x01000200, 0x00020001, 0x10000000,
+	0x0000001c, 0x8000c000, 0x000000ff, 0x55555500,
+	0x55555555, 0x00555555, 0x30000818, 0x40002000,
+	0x0000000c, 0x01000000, 0x00000080, 0x00010000,
+	0x00000000,
+};
+
+static_assert(ARRAY_SIZE(zx279133_uni_1g_profile) ==
+	      ZX279133_UNI_SERDES_PROFILE_WORDS);
+
+/*
+ * The image the bootloader itself leaves in this block, measured on the
+ * board on 2026-10-28 14:46 with `md 0x16100000 0x40` at the loader's
+ * prompt, after the loader's net init had run (the loader only configures
+ * this lane when its network is brought up - `uni serdes init succeed` and
+ * `mode_eth_1gbase_x_cfg` in its log).
+ *
+ * It differs from the image above in 18 of the 49 words, and the two that
+ * matter most are the mode word and word 0:
+ *
+ *	word 0		0xe0000004 here and in the image above (0xe0001004 was
+ *			the one that used to be wrong here)
+ *	word 21	(mode)	0x00000409 here, 0x00000100 in the image above (0x00000101 once enabled)
+ *
+ * Which image this is, settled by measurement on 2026-10-29 05:11 at the
+ * loader's own prompt in a boot where the loader took its 2.5G branch
+ * (docs/92 §96.15): the 49 words the loader left behind then are this
+ * image, word for word - 0 of 49 different.  The loader's other branch,
+ * the 1G one, leaves the image above (mode 0x101).  So this is the
+ * loader's 2.5G image, and the name it used to carry here ("the board's
+ * 1G base-X image") was wrong.
+ *
+ * The image above is the one that makes the four 1G jacks work today, so
+ * this one is not put in its place: the console writes either of them on
+ * demand, which is how the two are compared on a live board.
+ */
+static const u32 zx279133_uni_1gbase_x_profile[] = {
+	0xe0000004, 0x4fa8c0a2, 0x013e8604, 0x1f51c8f3,
+	0x00000044, 0x00194000, 0x00ff8000, 0x00238220,
+	0x80000100, 0x00050000, 0x0c633830, 0x00000000,
+	0x00000020, 0x00002000, 0x00000000, 0x00ff0000,
+	0x05a85100, 0x00000000, 0x04005b6a, 0x60002220,
+	0x34000003, 0x00000409, 0x00000080, 0x00000000,
+	0x200574a8, 0x00649052, 0x01000000, 0x40007700,
+	0xa9004000, 0x01108002, 0x000000da, 0x800000c8,
+	0x10371037, 0x01000200, 0x00020001, 0x10000000,
+	0x0000001c, 0x802dc000, 0x000000ff, 0x55555500,
+	0x55555555, 0x00555555, 0x30000818, 0x40002000,
+	0x0000000c, 0x01000000, 0x00000080, 0x00010000,
+	0x00000000,
+};
+
+static_assert(ARRAY_SIZE(zx279133_uni_1gbase_x_profile) ==
+	      ZX279133_UNI_SERDES_PROFILE_WORDS);
+
+/*
+ * The vendor's own 2.5G base-X image, word for word.
+ *
+ * Provenance: np_133.ko's uni_mode_eth_2p5gbase_x_cfg(), read out of the
+ * module with devtools/np133.py image (docs/92 §96.12).  The vendor picks
+ * this image with uni_serdes_init(port, 5) - modes 5 and 6 - and the 1G one
+ * with uni_serdes_init(port, 7) - modes 7 and 8 - so the two are two rate
+ * classes of the same lane and not two variants of one.
+ *
+ * The array above - the one this file used to call "the loader's measured
+ * base-X image" - is this image with two words changed: word 6
+ * (0x00ff8000 here, 0x0b080000 in the vendor's copy) and word 21, the mode
+ * word at 0x16100054 (0x409 here, 0x408 in the vendor's copy; bit 0 is the
+ * enable bit and the driver sets it anyway).
+ *
+ * The loader does not use this one: in its 2.5G branch the block is left
+ * holding the array above, word for word (0 of 49 different, measured
+ * 2026-10-29 05:11 at the loader's prompt, docs/92 §96.15), and this one
+ * differs from that in exactly the two words named here.
+ *
+ * The mode word is what tells the two apart at runtime: 0x101 is the 1G
+ * image, 0x409 is the 2.5G one.  On 2026-10-29 the driver was seen putting
+ * 0x101 into this block on every boot while the peer at the far end of the
+ * lane - the RTL8226 on the 2.5G jack - was in 2500BASE-X (MMD 0x1e reg
+ * 0x7580 = 0x9416).  Which image is right for which rate is the question
+ * docs/92 §96.12 asks, and this console can answer it by hand:
+ *
+ *	"write 2"	writes the vendor's 2.5G image
+ *
+ * The word 6 difference is not cosmetic: the vendor's 1G image has
+ * 0x0b016100 there and its 2.5G image 0x0b080000, so that word is part of
+ * the rate class, and the board's own measurement (0x00ff8000) is neither.
+ */
+static const u32 zx279133_uni_2p5gbase_x_profile[] = {
+	0xe0000004, 0x4fa8c0a2, 0x013e8604, 0x1f51c8f3,
+	0x00000044, 0x00194000, 0x0b080000, 0x00238220,
+	0x80000100, 0x00050000, 0x0c633830, 0x00000000,
+	0x00000020, 0x00002000, 0x00000000, 0x00ff0000,
+	0x05a85100, 0x00000000, 0x04005b6a, 0x60002220,
+	0x34000003, 0x00000408, 0x00000080, 0x00000000,
+	0x200574a8, 0x00649052, 0x01000000, 0x40007700,
+	0xa9004000, 0x01108002, 0x000000da, 0x800000c8,
+	0x10371037, 0x01000200, 0x00020001, 0x10000000,
+	0x0000001c, 0x802dc000, 0x000000ff, 0x55555500,
+	0x55555555, 0x00555555, 0x30000818, 0x40002000,
+	0x0000000c, 0x01000000, 0x00000080, 0x00010000,
+	0x00000000,
+};
+
+static_assert(ARRAY_SIZE(zx279133_uni_2p5gbase_x_profile) ==
+	      ZX279133_UNI_SERDES_PROFILE_WORDS);
+
+/*
+ * The three images this block can hold, in the order the console numbers
+ * them: 0 = the tree's own 1G image, 1 = the board's measured one, 2 = the
+ * vendor's 2.5G image.
+ */
+static const u32 *zx279133_uni_serdes_image(int sel)
+{
+	switch (sel) {
+	case 1:
+		return zx279133_uni_1gbase_x_profile;
+	case 2:
+		return zx279133_uni_2p5gbase_x_profile;
+	default:
+		return zx279133_uni_1g_profile;
+	}
+}
+
+static void zx279133_uni_serdes_write_profile(struct zx279133_uni_serdes *priv)
+{
+	const u32 *profile = (priv->submode == PHY_INTERFACE_MODE_SGMII ||
+			      priv->submode == PHY_INTERFACE_MODE_2500BASEX) ?
+		zx279133_uni_serdes_image(priv->image_sel) :
+		zx279133_uni_10g_profile;
+	unsigned int i;
+
+	for (i = 0; i < ZX279133_UNI_SERDES_PROFILE_WORDS; i++)
+		writel(profile[i], priv->serdes + i * 4);
+}
+
+static int zx279133_uni_serdes_set_mode(struct phy *phy, enum phy_mode mode,
+					int submode)
+{
+	struct zx279133_uni_serdes *priv = phy_get_drvdata(phy);
+
+	if (mode != PHY_MODE_ETHERNET)
+		return -EOPNOTSUPP;
+
+	if (submode != PHY_INTERFACE_MODE_USXGMII &&
+	    submode != PHY_INTERFACE_MODE_10GBASER &&
+	    submode != PHY_INTERFACE_MODE_SGMII &&
+	    submode != PHY_INTERFACE_MODE_2500BASEX)
+		return -EOPNOTSUPP;
+
+	/* nppt powers the SerDes off, sets the mode and powers it back on again, so
+	 * storing it here is enough to make the next power_on() write this lane's image.
+	 */
+	mutex_lock(&priv->lock);
+	priv->submode = submode;
+	mutex_unlock(&priv->lock);
+
+	return 0;
+}
+
+static int zx279133_uni_serdes_reset_pulse(struct zx279133_uni_serdes *priv)
+{
+	int ret;
+
+	ret = reset_control_bulk_assert(ARRAY_SIZE(priv->resets), priv->resets);
+	if (ret)
+		return ret;
+	usleep_range(ZX279133_UNI_RESET_PHASE_US,
+		     ZX279133_UNI_RESET_PHASE_US + 500);
+
+	ret = reset_control_bulk_deassert(ARRAY_SIZE(priv->resets), priv->resets);
+	if (ret)
+		return ret;
+	usleep_range(ZX279133_UNI_RESET_PHASE_US,
+		     ZX279133_UNI_RESET_PHASE_US + 500);
+
+	return 0;
+}
+
+static bool zx279133_uni_serdes_rate_matches(struct zx279133_uni_serdes *priv)
+{
+	u32 mode = readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+
+	if (priv->submode == PHY_INTERFACE_MODE_2500BASEX)
+		return mode == ZX279133_UNI_SERDES_MODE_2G5;
+	if (priv->submode == PHY_INTERFACE_MODE_SGMII)
+		return (mode & (ZX279133_UNI_SERDES_ENABLE |
+				ZX279133_UNI_SERDES_1G_RATE)) ==
+		       (ZX279133_UNI_SERDES_ENABLE |
+			ZX279133_UNI_SERDES_1G_RATE);
+	return false;
+}
+
+static void zx279133_uni_serdes_write_words(struct zx279133_uni_serdes *priv,
+					    const u32 *profile)
+{
+	unsigned int i;
+
+	for (i = 0; i < ZX279133_UNI_SERDES_PROFILE_WORDS; i++)
+		writel(profile[i], priv->serdes + i * 4);
+}
+
+/* In-place rate switch. Clocks are already on. No reset pulse. */
+static int zx279133_uni_serdes_program_rate(struct zx279133_uni_serdes *priv)
+{
+	u32 mode, word50, status = 0;
+	int ret;
+
+	mode = readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+	if (priv->submode == PHY_INTERFACE_MODE_2500BASEX) {
+		zx279133_uni_serdes_write_words(priv,
+						zx279133_uni_1gbase_x_profile);
+		writel(ZX279133_UNI_SERDES_MODE_2G5,
+		       priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+		ret = readl_poll_timeout(priv->serdes + ZX279133_UNI_SERDES_SC_PLL,
+					 status,
+					 (status & ZX279133_UNI_SERDES_SC_PLL_LOCK) ==
+					 ZX279133_UNI_SERDES_SC_PLL_LOCK,
+					 ZX279133_UNI_SERDES_POLL_US,
+					 ZX279133_UNI_SERDES_TIMEOUT_US);
+		if (ret) {
+			dev_err(priv->dev, "2.5G SC PLL did not lock (0xcc=%#x)\n",
+				status);
+			return ret;
+		}
+		ret = readl_poll_timeout(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS,
+					 status,
+					 status & ZX279133_UNI_SERDES_CDR_LOCK,
+					 ZX279133_UNI_SERDES_POLL_US,
+					 ZX279133_UNI_SERDES_TIMEOUT_US);
+		dev_info(priv->dev, "2.5G profile written: mode %#x, cdr %s (%#x)\n",
+			 readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL),
+			 ret ? "not locked" : "locked", status);
+		return 0;
+	}
+
+	word50 = readl(priv->serdes + ZX279133_UNI_SERDES_IMAGE_WORD);
+	if (!(mode & ZX279133_UNI_SERDES_1G_RATE) &&
+	    (word50 == ZX279133_UNI_SERDES_IMAGE_MARK ||
+	     (mode & ~ZX279133_UNI_SERDES_ENABLE) == 0)) {
+		zx279133_uni_serdes_write_words(priv, zx279133_uni_1g_profile);
+		if (word50 == ZX279133_UNI_SERDES_IMAGE_MARK &&
+		    (mode & ~ZX279133_UNI_SERDES_ENABLE) != 0)
+			dev_info(priv->dev,
+				 "1G: 2.5G image replaced in place\n");
+		else
+			dev_info(priv->dev, "1G profile written in place\n");
+	}
+	mode = readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+	writel(mode | ZX279133_UNI_SERDES_ENABLE | ZX279133_UNI_SERDES_1G_RATE,
+	       priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+	ret = readl_poll_timeout(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS,
+				 status, status & ZX279133_UNI_SERDES_PLL_LOCK,
+				 ZX279133_UNI_SERDES_POLL_US,
+				 ZX279133_UNI_SERDES_TIMEOUT_US);
+	if (ret) {
+		dev_err(priv->dev, "1G PLL did not lock (%#x)\n", status);
+		return ret;
+	}
+	dev_info(priv->dev, "Uni SerDes 1G: mode %#x, pll %#x\n",
+		 readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL),
+		 readl(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS));
+	return 0;
+}
+
+/*
+ * Read-only observation, not a cold-start fix. Caller holds priv->lock AND
+ * enabled clocks, including after a failed program_rate() but before cleanup.
+ * priv->powered may still be false on that first attempt. Do not expose these
+ * reads through an unguarded asynchronous debugfs/MMIO path.
+ */
+static void
+zx279133_uni_serdes_rate_snapshot(struct zx279133_uni_serdes *priv,
+				 const char *stage, int result)
+{
+	u32 mode = 0, word0 = 0, word50 = 0, value, mask;
+	u32 sc_pll, pll, rx;
+	unsigned int i, diff1g = 0, diff2g5 = 0;
+	int reset_rx, reset_tx;
+
+	lockdep_assert_held(&priv->lock);
+	for (i = 0; i < ZX279133_UNI_SERDES_PROFILE_WORDS; i++) {
+		value = readl(priv->serdes + i * 4);
+		mask = ~0U;
+		if (!i)
+			word0 = value;
+		if (i * 4 == ZX279133_UNI_SERDES_IMAGE_WORD)
+			word50 = value;
+		if (i * 4 == ZX279133_UNI_SERDES_MODE_CTRL) {
+			mode = value;
+			mask &= ~ZX279133_UNI_SERDES_ENABLE;
+		}
+		if ((value & mask) != (zx279133_uni_1g_profile[i] & mask))
+			diff1g++;
+		if ((value & mask) != (zx279133_uni_1gbase_x_profile[i] & mask))
+			diff2g5++;
+	}
+	sc_pll = readl(priv->serdes + ZX279133_UNI_SERDES_SC_PLL);
+	pll = readl(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS);
+	rx = readl(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS);
+	/* Negative status means unavailable/error, not "reset deasserted". */
+	reset_rx = reset_control_status(priv->resets[0].rstc);
+	reset_tx = reset_control_status(priv->resets[1].rstc);
+	dev_info(priv->dev,
+		 "LAN1_RATE_DIAG attempt=%u stage=%s result=%d submode=%d powered=%u pending=%u pclk=%lu ref50m=%lu reset_rx=%d reset_tx=%d mode=%#x word0=%#x word50=%#x diff1g=%u diff2g5=%u sc_pll=%#x pll=%#x rx=%#x\n",
+		 priv->rate_diag_count, stage, result, priv->submode,
+		 priv->powered, priv->rate_pending,
+		 clk_get_rate(priv->clocks[0].clk),
+		 clk_get_rate(priv->clocks[1].clk), reset_rx, reset_tx,
+		 mode, word0, word50, diff1g, diff2g5, sc_pll, pll, rx);
+}
+
+static int zx279133_uni_serdes_power_on(struct phy *phy)
+{
+	struct zx279133_uni_serdes *priv = phy_get_drvdata(phy);
+	bool was_powered, diagnose;
+	u32 status;
+	int ret;
+
+	mutex_lock(&priv->lock);
+	was_powered = priv->powered;
+
+	if (priv->submode == PHY_INTERFACE_MODE_SGMII ||
+	    priv->submode == PHY_INTERFACE_MODE_2500BASEX) {
+		if (!was_powered) {
+			ret = clk_bulk_prepare_enable(ARRAY_SIZE(priv->clocks),
+						      priv->clocks);
+			if (ret)
+				goto out_unlock;
+		} else if (!priv->rate_pending &&
+			   zx279133_uni_serdes_rate_matches(priv)) {
+			ret = 0;
+			goto out_unlock;
+		}
+
+		diagnose = priv->rate_diag_count < ZX279133_UNI_RATE_DIAG_LIMIT;
+		if (diagnose) {
+			priv->rate_diag_count++;
+			zx279133_uni_serdes_rate_snapshot(priv, "before", 0);
+		}
+		/*
+		 * A cold loader path can leave TX held in reset even though RX is
+		 * released. Writing the rate image cannot release either reset.
+		 * Deassert only on first power-on: never pulse a working lane or
+		 * disturb the reset lifecycle during an in-place rate change.
+		 */
+		ret = 0;
+		if (!was_powered) {
+			ret = reset_control_bulk_deassert(ARRAY_SIZE(priv->resets),
+						  priv->resets);
+			if (!ret)
+				usleep_range(ZX279133_UNI_RESET_PHASE_US,
+					     ZX279133_UNI_RESET_PHASE_US + 500);
+		}
+		if (!ret)
+			ret = zx279133_uni_serdes_program_rate(priv);
+		if (diagnose)
+			zx279133_uni_serdes_rate_snapshot(priv, "after", ret);
+		if (ret) {
+			if (!was_powered)
+				clk_bulk_disable_unprepare(ARRAY_SIZE(priv->clocks),
+							   priv->clocks);
+			else
+				priv->rate_pending = true;
+			goto out_unlock;
+		}
+		priv->powered = true;
+		priv->rate_pending = false;
+		ret = 0;
+		goto out_unlock;
+	}
+
+	if (priv->powered) {
+		ret = 0;
+		goto out_unlock;
+	}
+
+	/*
+	 * Do not read this block before the clocks are on.  The registers live
+	 * behind the UNI SerDes CSR clock, and a readl() of them while that
+	 * clock is still gated is a bus abort, not a zero.
+	 */
+	ret = clk_bulk_prepare_enable(ARRAY_SIZE(priv->clocks), priv->clocks);
+	if (ret)
+		goto out_unlock;
+
+	ret = zx279133_uni_serdes_reset_pulse(priv);
+	if (ret)
+		goto err_disable_clocks;
+
+	zx279133_uni_serdes_write_profile(priv);
+	status = readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+	writel(status | ZX279133_UNI_SERDES_ENABLE,
+	       priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+
+	ret = readl_poll_timeout(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS,
+				 status, status & ZX279133_UNI_SERDES_PLL_LOCK,
+				 ZX279133_UNI_SERDES_POLL_US,
+				 ZX279133_UNI_SERDES_TIMEOUT_US);
+	if (ret)
+		goto err_disable_clocks;
+
+	status = readl(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS);
+	if (!(status & ZX279133_UNI_SERDES_RX_LOS)) {
+		ret = readl_poll_timeout(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS,
+					 status,
+					 status & ZX279133_UNI_SERDES_CDR_LOCK,
+					 ZX279133_UNI_SERDES_POLL_US,
+					 ZX279133_UNI_SERDES_TIMEOUT_US);
+		if (ret)
+			goto err_disable_clocks;
+	}
+
+	dev_info(priv->dev, "Uni SerDes 10G profile written: mode %#x, status %#x/%#x\n",
+		 readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL),
+		 readl(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS),
+		 readl(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS));
+	priv->powered = true;
+	ret = 0;
+	goto out_unlock;
+
+err_disable_clocks:
+	writel(readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL) &
+	       ~ZX279133_UNI_SERDES_ENABLE,
+	       priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+	clk_bulk_disable_unprepare(ARRAY_SIZE(priv->clocks), priv->clocks);
+out_unlock:
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
+/* Caller holds priv->lock; unlike a rate change, teardown releases clocks. */
+static void
+zx279133_uni_serdes_force_off_locked(struct zx279133_uni_serdes *priv)
+{
+	if (priv->powered) {
+		writel(readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL) &
+		       ~ZX279133_UNI_SERDES_ENABLE,
+		       priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(priv->clocks), priv->clocks);
+		priv->powered = false;
+	}
+	priv->rate_pending = false;
+}
+
+static int zx279133_uni_serdes_power_off(struct phy *phy)
+{
+	struct zx279133_uni_serdes *priv = phy_get_drvdata(phy);
+
+	mutex_lock(&priv->lock);
+	if (priv->submode == PHY_INTERFACE_MODE_SGMII ||
+	    priv->submode == PHY_INTERFACE_MODE_2500BASEX) {
+		/* A rate change must not gate the clock or pulse the reset.
+		 * The next power_on() rewrites the 49 words in place.
+		 */
+		priv->rate_pending = true;
+		mutex_unlock(&priv->lock);
+		return 0;
+	}
+	zx279133_uni_serdes_force_off_locked(priv);
+	mutex_unlock(&priv->lock);
+
+	return 0;
+}
+
+static const struct phy_ops zx279133_uni_serdes_ops = {
+	.set_mode = zx279133_uni_serdes_set_mode,
+	.power_on = zx279133_uni_serdes_power_on,
+	.power_off = zx279133_uni_serdes_power_off,
+	.owner = THIS_MODULE,
+};
+
+static void zx279133_uni_serdes_cleanup(void *data)
+{
+	struct zx279133_uni_serdes *priv = data;
+
+	mutex_lock(&priv->lock);
+	zx279133_uni_serdes_force_off_locked(priv);
+	mutex_unlock(&priv->lock);
+}
+
+/*
+ * debugfs hands the pointer given to debugfs_create_file() to the
+ * inode as inode->i_private - it does not fill file->private_data.
+ * The console wants the pointer in file->private_data, so it has to
+ * be picked up when the file is opened.
+ */
+static int zx279133_uni_serdes_console_open(struct inode *inode,
+					    struct file *file)
+{
+	file->private_data = inode->i_private;
+
+	return 0;
+}
+
+/*
+ * A console for this block.
+ *
+ * The point is to be able to compare the image in the block with what the
+ * bootloader leaves behind - the driver's own check compares the block with
+ * the array in this file, which is circular and once hid a one-bit
+ * difference (word 0 was 0xe0001004 here and 0xe0000004 in the loader).
+ *
+ *	"dump"		print the first 256 words and the two status words,
+ *			and the words in which image 0 and the selected image
+ *			differ
+ *	"write"		write the image the tree uses again, and set the
+ *			enable bit
+ *	"write 1"	write the board's measured image (the mode word
+ *			0x409)
+ *	"write 2"	write the vendor's own 2.5G base-X image
+ *	"reset"	pulse the rx/tx resets
+ */
+static ssize_t zx279133_uni_serdes_console(struct file *file,
+					   const char __user *ubuf,
+					   size_t count, loff_t *ppos)
+{
+	struct zx279133_uni_serdes *priv = file->private_data;
+	enum {
+		ZX279133_UNI_DUMP,
+		ZX279133_UNI_WRITE,
+		ZX279133_UNI_RESET,
+	} cmd;
+	char buf[32];
+	unsigned int i;
+	ssize_t result = count;
+	int which = -1;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	if (!strncmp(buf, "dump", 4)) {
+		cmd = ZX279133_UNI_DUMP;
+	} else if (!strncmp(buf, "write", 5)) {
+		cmd = ZX279133_UNI_WRITE;
+		if (buf[5] == ' ') {
+			if (kstrtoint(buf + 6, 0, &which) || which < 0 || which > 2)
+				return -EINVAL;
+		}
+	} else if (!strncmp(buf, "reset", 5)) {
+		cmd = ZX279133_UNI_RESET;
+	} else {
+		return -EINVAL;
+	}
+
+	mutex_lock(&priv->lock);
+	if (!priv->powered) {
+		result = -EAGAIN;
+		goto out_unlock;
+	}
+
+	if (cmd == ZX279133_UNI_DUMP) {
+		const u32 *other = zx279133_uni_serdes_image(priv->image_sel);
+		unsigned int diff = 0;
+
+		for (i = 0; i < 256; i++)
+			pr_info("uni serdes +0x%03x = 0x%08x\n", i * 4,
+				readl(priv->serdes + i * 4));
+		pr_info("uni serdes: mode 0x%08x status 0x%08x/0x%08x\n",
+			readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL),
+			readl(priv->serdes + ZX279133_UNI_SERDES_PLL_STATUS),
+			readl(priv->serdes + ZX279133_UNI_SERDES_RX_STATUS));
+		pr_info("uni serdes: image %d\n", priv->image_sel);
+		for (i = 0; i < ZX279133_UNI_SERDES_PROFILE_WORDS; i++)
+			if (zx279133_uni_1g_profile[i] != other[i]) {
+				pr_info("uni serdes: word %u differs: own 0x%08x, image %d 0x%08x\n",
+					i, zx279133_uni_1g_profile[i], priv->image_sel,
+					other[i]);
+				diff++;
+			}
+		pr_info("uni serdes: %u of %d word(s) differ between image 0 and image %d\n",
+			diff, ZX279133_UNI_SERDES_PROFILE_WORDS, priv->image_sel);
+		goto out_unlock;
+	}
+
+	if (cmd == ZX279133_UNI_WRITE) {
+		if (which < 0)
+			which = priv->image_sel;
+		priv->image_sel = which;
+		zx279133_uni_serdes_write_profile(priv);
+		writel(readl(priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL) |
+			ZX279133_UNI_SERDES_ENABLE,
+			priv->serdes + ZX279133_UNI_SERDES_MODE_CTRL);
+		pr_info("uni serdes: image %d written again\n", which);
+		goto out_unlock;
+	}
+
+	if (cmd == ZX279133_UNI_RESET) {
+		int ret;
+
+		ret = zx279133_uni_serdes_reset_pulse(priv);
+		pr_info("uni serdes: reset pulse returned %d\n", ret);
+		if (ret)
+			result = ret;
+	}
+
+out_unlock:
+	mutex_unlock(&priv->lock);
+	return result;
+}
+
+static const struct file_operations zx279133_uni_serdes_console_fops = {
+	.owner	= THIS_MODULE,
+	.open	= zx279133_uni_serdes_console_open,
+	.write	= zx279133_uni_serdes_console,
+};
+
+static void zx279133_uni_serdes_debugfs_remove(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+static int zx279133_uni_serdes_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct zx279133_uni_serdes *priv;
+	struct phy_provider *provider;
+	struct phy *phy;
+	struct dentry *dir, *df;
+	int ret;
+
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->dev = dev;
+	mutex_init(&priv->lock);
+	priv->serdes = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(priv->serdes))
+		return PTR_ERR(priv->serdes);
+
+	priv->clocks[0].id = "pclk";
+	priv->clocks[1].id = "ref50m";
+	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(priv->clocks), priv->clocks);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get Uni SerDes clocks\n");
+
+	priv->resets[0].id = "rx";
+	priv->resets[1].id = "tx";
+	ret = devm_reset_control_bulk_get_exclusive(dev,
+						    ARRAY_SIZE(priv->resets),
+						    priv->resets);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get Uni SerDes resets\n");
+
+	phy = devm_phy_create(dev, NULL, &zx279133_uni_serdes_ops);
+	if (IS_ERR(phy))
+		return dev_err_probe(dev, PTR_ERR(phy), "failed to create PHY\n");
+
+	phy_set_drvdata(phy, priv);
+	platform_set_drvdata(pdev, priv);
+
+	ret = devm_add_action_or_reset(dev, zx279133_uni_serdes_cleanup, priv);
+	if (ret)
+		return ret;
+
+	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
+	if (IS_ERR(provider))
+		return PTR_ERR(provider);
+
+	/*
+	 * The console, and the reason it is built this way:
+	 *
+	 * The kernel has no devm_debugfs_create_file() and no
+	 * devm_debugfs_create_dir().  Those names do not exist upstream - the
+	 * only devm helpers of that shape are the devm_k*() ones - and
+	 * writing them down here is what broke the build in CI run #217.
+	 * debugfs_create_dir() and debugfs_create_file() take five arguments
+	 * (name, mode, parent, data, fops); the old "aux" argument is
+	 * gone, and there is a separate debugfs_create_file_aux() for the
+	 * rare caller that wants one.
+	 *
+	 * The directory is removed with the device, so the cleanup goes
+	 * through devm_add_action_or_reset() the way the NPPT console does.
+	 * debugfs_remove_recursive() takes the file with the directory.
+	 */
+	dir = debugfs_create_dir("zx279133-uni-serdes", NULL);
+	if (IS_ERR(dir)) {
+		/* No debugfs: the block still works, there is just no console. */
+		dev_info(dev, "debugfs is not available, no console for this block\n");
+		return 0;
+	}
+	ret = devm_add_action_or_reset(dev, zx279133_uni_serdes_debugfs_remove,
+				       dir);
+	if (ret)
+		return ret;
+
+	df = debugfs_create_file("serdes", 0644, dir, priv,
+				 &zx279133_uni_serdes_console_fops);
+	if (IS_ERR(df)) {
+		dev_warn(dev, "no console file for this block\n");
+		return 0;
+	}
+
+	return 0;
+}
+
+static const struct of_device_id zx279133_uni_serdes_of_match[] = {
+	{ .compatible = "zte,zx279133-uni-serdes" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, zx279133_uni_serdes_of_match);
+
+static struct platform_driver zx279133_uni_serdes_driver = {
+	.probe = zx279133_uni_serdes_probe,
+	.driver = {
+		.name = "zx279133-uni-serdes",
+		.of_match_table = zx279133_uni_serdes_of_match,
+	},
+};
+module_platform_driver(zx279133_uni_serdes_driver);
+
+MODULE_DESCRIPTION("ZTE ZX279133 internal Uni SerDes PHY");
+MODULE_LICENSE("GPL");

@@ -1,0 +1,2137 @@
+name: ZX279133 SK-D840N Build
+
+# Phase 2: Skyworth SK-D840N (same ZX279133 SoC as SR1010) built from
+#   base   = cnjn/ImmortalWrt target zte/zx279133  (+ our image profile)
+#   kernel = pinned ZX279133 6.18.38 + official stable updates to 6.18.60
+#   format = the flash layout proven by huxiangjs/SK-D840N-OpenWRT, so the
+#            U-Boot that is already in this board boots it with no serial cable.
+#
+# mode=initramfs -> RAM FIT .itb (trial via kexec from the running system)
+# mode=flash     -> uImage + dtb.bin + rootfs.jffs2 for the kernel/dtb/root partitions
+# mode=bootweb   -> public svn308776 native241 resident candidate (OFFLINE only)
+# mode=all      -> both firmware modes plus the independent bootweb job
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '构建模式'
+        required: false
+        default: 'all'
+        type: choice
+        options: ['all', 'both', 'initramfs', 'flash', 'bootweb']
+      clean_cache:
+        description: '忽略 dl/ 缓存'
+        required: false
+        default: 'false'
+        type: boolean
+      publish_release:
+        description: '发布 Release（RAM 对照测试请关闭）'
+        required: false
+        default: true
+        type: boolean
+  push:
+    paths:
+      - .github/workflows/build-sk-d840n.yml
+      - bootweb/**
+      - tests/test_bootweb_ci_workflow.py
+      - kernel-overlays/**
+      - kernel-patches/**
+      - overlays/**
+      - configs/sk-d840n*
+      - tests/test_sk_kernel.py
+      - tests/test_sk_tcp_optimization.py
+      - tests/sk_tcp_harness.h
+      - tests/test_sk_lan1_power.py
+      - tests/sk_lan1_power_harness.h
+      - tests/test_sk_serdes_diag.py
+      - tests/sk_serdes_diag_harness.h
+      - tests/fixtures/phy-core-power.inc
+      - scripts/configure-sk-d840n.sh
+      - scripts/prepare-sk-d840n-ui.sh
+      - scripts/sk-d840n-theme.sh
+      - scripts/sk-d840n-offload.sh
+      - scripts/check-sk-d840n-management.sh
+      - scripts/check-sk-d840n-ucode.sh
+      - tests/*sk_pon*
+      - tests/*sk_lan1_led*
+      - tests/*sk_lan1_phy_led*
+      - tests/*sk_led*
+      - tests/*sk_offload*
+      - tests/test_sysupgrade.py
+      - tests/test_mtd_rw.py
+      - tests/test_sk_layout.py
+      - tests/test_sk_uboot.py
+      - tests/sk_layout_fixture.py
+      - tests/sk_omci*
+      - templates/**
+      # The trial files go into the RAM image (the initramfs mode copies
+      # trial-files/ into openwrt/files/), so a change to them changes the
+      # image and has to rebuild it.  They were missing from this list, so
+      # a fix to them - the DHCP server that never started, for one -
+      # could be pushed and would never reach a board.
+      - trial-files/**
+      # The gate and the notes are part of the build: tools/macrocheck.py is
+      # a build step (it fails the build when a driver cannot see a macro it
+      # uses), and docs/ hold the measurements the gate is checked against.
+      # They were missing from this list, so run 126 - a fix to the gate
+      # itself - was pushed and never started a build.
+      - tools/**
+      - docs/**
+
+env:
+  IW_URL: https://github.com/cnjn/ImmortalWrt
+  IW_BRANCH: sr1010-zx279133
+  IW_SHA: 1b50aaf4ed9cf042df6207564555b244d6ced517
+  KERNEL_URL: https://github.com/cnjn/linux-mainline-zte-zxslc-sr1010
+  KERNEL_BRANCH: build
+  KERNEL_SOURCE_DIR: linux-mainline-zte-zxslc-sr1010/linux-6.18.38
+  # Pinned because cloning the branch tip makes every build a race with somebody else's push, and that
+  # race is what killed runs 72/73/74 identically: 21 errors, all in `zx279133-offload.c`, a file we do
+  # not overlay, because our overlay set had fallen behind his driver revision and shadowed five files
+  # while his new offload.c called functions that only his netdev.c and np.c define.
+  # The overlay set is now his driver as of this commit plus exactly three measured value changes
+  # (docs/09 §2b, docs/10 §6): header `IDM_TX_CFG_DEPTH 0 -> 0x400`, and in zx279133-idm.c
+  # `0x00003d00 -> IDM_BP_RING_SIZE` at +0x10c/+0x110 and `0 -> 0x00000040` at +0x124. Those three are
+  # upstream bugs in his port, measured against the bootloader that carries traffic: his own tree
+  # contains all three wrong values verbatim.
+  # Raising this sha therefore means re-taking the six overlaid driver files from the new revision and
+  # re-applying only those three changes; the copies in this repository are otherwise his, byte for byte.
+  KERNEL_SHA: 96e5a2413524742e177e383fe523ef21de5ed238
+  # Resulting version, NOT the wrapper's historical submodule directory name.
+  # configs/sk-d840n-stable.json pins every official patch; tests check agreement.
+  KVER: '6.18.60'
+
+permissions: write-all
+
+jobs:
+  check-led-gates:
+    name: LED CI regression
+    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'bootweb'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DTS regression tools
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install --no-install-recommends device-tree-compiler libfdt-dev python3-yaml
+      - name: Exercise the workflow's DTS and LED gates
+        run: |
+          python3 tests/test_sk_kernel.py
+          python3 tests/test_sk_tcp_optimization.py --require-compiler
+          python3 tests/test_sk_lan1_power.py --require-compiler
+          python3 tests/test_sk_serdes_diag.py --require-compiler
+          python3 tests/test_kernel_version_single_source.py
+          python3 tests/test_sk_lan1_phy_led.py
+          python3 tests/test_sk_led_dts_gate.py
+          python3 tests/test_sk_layout.py
+          python3 tests/test_sk_uboot.py
+
+  build:
+    name: ${{ matrix.mode }}
+    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'bootweb'
+    needs: check-led-gates
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [initramfs, flash]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip by input mode
+        id: pick
+        run: |
+          want="${{ inputs.mode }}"
+          [ -z "$want" ] && want=all
+          if [ "$want" = all ] || [ "$want" = both ] || [ "$want" = "${{ matrix.mode }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --force || true
+          sudo -E apt-get -qq autoremove --purge || true
+          df -hT
+
+      - name: Init build environment
+        if: steps.pick.outputs.run == 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libfdt-dev libglib2.0-dev libgmp3-dev libjson-c-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libncursesw5-dev \
+            libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp \
+            nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-venv python3-ply python3-docutils \
+            python3-pyelftools bc dwarves qemu-utils qemu-user re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+      - name: Prepare firmware tools and upgrade regression tests
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/skd840n-firmware-venv"
+          PY="$RUNNER_TEMP/skd840n-firmware-venv/bin/python"
+          "$PY" -m pip install --quiet --disable-pip-version-check 'zopfli==0.4.3' 'PyYAML==6.0.3'
+          echo "SKD840N_HOST_PYTHON=$PY" >> "$GITHUB_ENV"
+          "$PY" tests/test_sysupgrade.py
+          "$PY" tests/test_mtd_rw.py
+          sh -n overlays/target/linux/zte/zx279133/base-files/lib/upgrade/platform.sh
+
+      - name: Rust 1.96.1 and offline ONU regression tests
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup target add --toolchain 1.96.1 aarch64-unknown-linux-musl
+          export ZX_CARGO="$(rustup which --toolchain 1.96.1 cargo)"
+          echo "ZX_CARGO=$ZX_CARGO" >> "$GITHUB_ENV"
+          set +e
+          {
+            node tests/test_sk_pon_ui.js &&
+            python3 tests/test_sk_pon_contract.py &&
+            python3 tests/test_sk_pon_firstboot.py &&
+            python3 tests/test_sk_pon_theme.py &&
+            python3 tests/test_sk_lan1_led.py &&
+            python3 tests/test_sk_lan1_phy_led.py &&
+            python3 tests/test_sk_led_probe.py &&
+            python3 tests/test_sk_led_triggers.py &&
+            node tests/test_sk_led_ui.js &&
+            python3 tests/test_sk_offload.py &&
+            sh tests/test_sk_pon_host.sh &&
+            sh scripts/check-sk-d840n-ucode.sh
+          } 2>&1 | tee sk-pon-tests.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            # GitHub caps annotations per step. One escaped multi-line message
+            # preserves the actual final error instead of the first ten lines.
+            message=$(tail -n 65 sk-pon-tests.log | python3 -c 'import sys; s=sys.stdin.read()[-2600:]; print(s.replace("%","%25").replace("\r","").replace("\n","%0A"))')
+            echo "::error::$message"
+          fi
+          exit "$rc"
+
+      - name: Clone sources
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          git clone --depth 1 -b "$IW_BRANCH" "$IW_URL" openwrt
+          git -C openwrt fetch --depth 1 origin "$IW_SHA"
+          git -C openwrt checkout --detach "$IW_SHA"
+          test "$(git -C openwrt rev-parse HEAD)" = "$IW_SHA"
+          git clone --branch "$KERNEL_BRANCH" --recurse-submodules "$KERNEL_URL" linux-mainline-zte-zxslc-sr1010
+          # --shallow-submodules would fetch only the commit the branch pointer names, which is the
+          # thing being moved off; a full submodule fetch is what lets the checkout below reach it.
+          # build is a wrapper branch. KERNEL_SHA names a Linux commit, not a
+          # wrapper commit: pin the submodule that every build step actually uses.
+          KT="$KERNEL_SOURCE_DIR"
+          git -C "$KT" checkout --detach "$KERNEL_SHA"
+          git -C "$KT" submodule update --init --recursive
+          test "$(git -C "$KT" rev-parse HEAD)" = "$KERNEL_SHA"
+          test -f "$KT/arch/arm64/boot/dts/zte/zx279133.dtsi"
+          echo "Pinned Linux tree: $(git -C "$KT" rev-parse HEAD)"
+
+      - name: Apply checksum-pinned official stable updates
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          python3 tools/prepare-sk-kernel.py --tree "$KERNEL_SOURCE_DIR" --version "$KVER" --openwrt openwrt
+          test "$(make -s -C "$KERNEL_SOURCE_DIR" kernelversion)" = "$KVER"
+          cat kernel-provenance.json
+
+      # CONFIG_DEVMEM, and why the earlier attempts at it went nowhere.
+      #
+      # (This prose used to live inside the `run:` script of this step.  GitHub
+      # Actions refuses a workflow whose single run script is longer than 21000
+      # characters - "Invalid workflow file ... Exceeded max expression length
+      # 21000" - and this step was already at 20636, so a single extra
+      # paragraph in it is enough to stop the build from starting at all.
+      # The story belongs here, where it costs nothing.)
+      #
+      # Without /dev/mem the trial kernel gives no way to read a register: mknod
+      # succeeds, open() returns ENXIO, `ethtool -d eth0` is "Not supported", and
+      # the busybox in the RAM image has no devmem applet.  That makes U-Boot the
+      # only register view, and U-Boot is gone the moment Linux is running - so a
+      # boot that links but moves nothing can only be scored from the outside,
+      # which is exactly the state runs 42-45 were left in.
+      #
+      # Runs 42/43 pinned the symbol and the merged .config still had none, and
+      # the reason is now read straight out of the two fragments the clone
+      # carries:
+      #   target/linux/generic/config-6.18:1404      # CONFIG_DEVMEM is not set
+      #   target/linux/zte/zx279133/config-6.18:285  # CONFIG_DEVMEM is not set
+      # OpenWrt concatenates generic -> target -> subtarget and kconfig keeps the
+      # last statement for a symbol, so editing anything but the subtarget
+      # fragment cannot win.  The subtarget file is 17 KB of deliberate choices,
+      # so it is edited in place rather than replaced by an overlay copy of it.
+      #
+      # STRICT_DEVMEM is already off in generic, so =y here means full /dev/mem,
+      # and CONFIG_IO_STRICT_DEVMEM=y is inert behind it.  This is asserted
+      # before the build because a broken edit here is cheap now and costs a
+      # whole round later; the merged result is still only reported after the
+      # compile, so an instrument that fails to switch on never withholds a kit
+      # that works.
+      #
+      # Three fragments, not two.  Run 51 is the evidence: the subtarget was
+      # pinned, the pin asserted green, and the *shipped kernel* still carried
+      # `# CONFIG_DEVMEM is not set` - read straight out of the IKCFG_ST block
+      # inside the built Image (gunzip staging/trial/trial-Image.gz; the gzip
+      # between IKCFG_ST and IKCFG_ED is the whole .config), which needs no board
+      # and no job log.  So "generic -> target -> subtarget, last one wins" was
+      # not the rule, and the only edit that cannot lose is the one that leaves
+      # no fragment saying "not set" anywhere under target/linux.
+      #
+      # And that was still not the rule either.  The fourth read of this symbol
+      # went to include/kernel-defaults.mk and found it: Kernel/Configure/Default
+      # first runs `$(LINUX_CONF_CMD) > .config.target` (that is the fragment
+      # merge), then APPENDS every `CONFIG_KERNEL_*` line of the build-root
+      # .config to the same file with the prefix stripped, then kconfig.pl merges
+      # it.  `config KERNEL_DEVMEM` in config/Config-kernel.in has no default, so
+      # defconfig writes `# CONFIG_KERNEL_DEVMEM is not set`, and the awk turns
+      # that into a trailing `# CONFIG_DEVMEM is not set` that outranks every
+      # fragment.  These sed edits are what the seed carries, and they are kept
+      # because they are true; the edit that wins is pin_y_build KERNEL_DEVMEM in
+      # scripts/configure-sk-d840n.sh, and the check that settles it is the
+      # merged state printed after the compile, never the seed.
+      - name: Check the overlay for what a compiler would have caught
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          # Runs 105 to 108 all failed on one line of zx279133.h: two #defines
+          # on one line, so the preprocessor read the second one as part of
+          # the first one's replacement list and every use of the first macro
+          # expanded to a stray '#'.  Four builds and four hours for a
+          # missing newline.  This check is what catches that class of
+          # mistake in a second, before the kernel is built.
+          #
+          # It reads only the overlay, so it costs nothing but the time to
+          # walk thirteen files, and it runs before the long build rather
+          # than after it.
+          python3 tools/prepush.py "$GITHUB_WORKSPACE"
+      - name: Apply SK-D840N overlays
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          KT="$KERNEL_SOURCE_DIR"
+          cp -a kernel-overlays/. "$KT"/
+          cp -a overlays/. openwrt/
+          # SK-D840N WiFi build-compat: this custom 6.18.60 tree lacks OpenWrt's
+          # CFG80211_HEADERS patch, so backports needs net_device->ieee80211_ptr
+          # exposed under CONFIG_WIRELESS instead of CONFIG_CFG80211. Idempotent.
+          ND="$KT/include/linux/netdevice.h"
+          if grep -q 'IS_ENABLED(CONFIG_CFG80211)' "$ND" && grep -q 'struct wireless_dev.*ieee80211_ptr' "$ND"; then
+            git -C "$KT" apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/compat/422-sk-d840n-6.18-ieee80211-ptr.patch" \
+              || { echo '::error::failed to apply netdevice.h ieee80211_ptr compat patch'; exit 1; }
+            echo 'applied netdevice.h ieee80211_ptr compat patch'
+          elif grep -q 'IS_ENABLED(CONFIG_WIRELESS)' "$ND" && grep -q 'struct wireless_dev.*ieee80211_ptr' "$ND"; then
+            echo 'netdevice.h ieee80211_ptr compat already present; skip'
+          fi
+          python3 tools/check-sk-offload.py --kernel-tree "$KT"
+          sh tools/check-sk-kconfig.sh "$KT"
+          # board dts must be reachable and the SoC dtsi unmodified
+          test -f "$KT/arch/arm64/boot/dts/zte/zx279133-sk-d840n.dts"
+          grep -q 'zx279133-sk-d840n.dtb' "$KT/arch/arm64/boot/dts/zte/Makefile"
+          grep -q 'Device/skyworth_sk-d840n' openwrt/target/linux/zte/image/Makefile
+          # board.d/02_network replaces cnjn's file, so the sr1010 case has to be
+          # in the replacement too - and this board needs its own, because without
+          # it the image boots with no interface configured for it at all.
+          NET=openwrt/target/linux/zte/zx279133/base-files/etc/board.d/02_network
+          grep -q 'zte,zx279133-sr1010' "$NET"
+          grep -q 'skyworth,sk-d840n' "$NET"
+          # The lan address has to be stated in the file, not left to config_generate, whose
+          # default for lan is 192.168.1.1. dropbear ships `option Interface 'lan'` and binds to
+          # the addresses on that interface, so the default would decide the one address ssh
+          # answers on - and it is also the address the owner's own router holds on the LAN this
+          # PC is attached to, so nothing that pings can tell the two apart. Assert the literal
+          # here so an edit that drops it fails the build instead of shipping a board that is up
+          # and unreachable.
+          grep -q 'ipaddr "192\.168\.9\.1"' "$NET" || {
+            echo "::error::02_network no longer pins lan to 192.168.9.1"; exit 1; }
+          # and it must still be LF: the call spans a backslash continuation, and a CRLF checkout
+          # turns the arguments into empties on the device (verified - the four options come
+          # through empty). board.d files have no .sh suffix, so .gitattributes' *.sh rule does
+          # not cover them; this is the belt to that braces.
+          #
+          # grep -U with a $'\r' is NOT portable here and silently matches nothing - it was
+          # tried and reported the CRLF copy as clean. Counting CR bytes is unambiguous:
+          # a pure-LF file has exactly zero.
+          CRCOUNT=$(tr -cd '\r' < "$NET" | wc -c)
+          if [ "$CRCOUNT" != 0 ]; then
+            echo "::error::02_network carries $CRCOUNT CR byte(s) - it is a shell script and CRLF breaks its continuation"; exit 1
+          fi
+          # Legacy NAT compatibility for images predating firewall4.
+          # Current images use fw4; both legacy entry points exit when it is
+          # installed. Keep their old rule valid for older images, and check
+          # the ownership-checked migration script as well.
+          NAT=openwrt/target/linux/zte/zx279133/base-files/etc/init.d/sk-nat
+          NATD=openwrt/target/linux/zte/zx279133/base-files/etc/uci-defaults/99-sk-nat
+          for f in "$NAT" "$NATD" openwrt/target/linux/zte/zx279133/base-files/etc/uci-defaults/98-sk-firewall4; do
+            test -f "$f" || { echo "::error::$f did not reach the tree"; exit 1; }
+            sh -n "$f" || { echo "::error::$f does not parse"; exit 1; }
+            CR=$(tr -cd '\r' < "$f" | wc -c)
+            [ "$CR" = 0 ] || { echo "::error::$f carries $CR CR byte(s) - it is a shell script"; exit 1; }
+          done
+          # The rule has to be the one the plan asks for: a masquerade on the
+          # wan port, with the counter BEFORE the masquerade - masquerade is a
+          # terminal statement and nft rejects anything that follows it, so a
+          # rule written the other way round never loads.
+          grep -q 'counter masquerade' "$NAT" || {
+            echo "::error::sk-nat does not install a counted masquerade rule"; exit 1; }
+          # And the uci-defaults has to link the script in, or it never runs:
+          # an init script that is not in /etc/rc.d is not started.
+          grep -q '/etc/rc.d/S96sk-nat' "$NATD" || {
+            echo "::error::99-sk-nat does not link sk-nat into /etc/rc.d"; exit 1; }
+          # CONFIG_DEVMEM, and why the earlier attempts at it went nowhere.  The long
+          # story is in the YAML comment above this step; what is left here is the
+          # edit itself and the assertions around it.
+          DEVMEM_OFF='# CONFIG_DEVMEM is not set'
+          # Three fragments, not two (see the YAML comment above): a fragment that
+          # still says "not set" anywhere under target/linux outranks the pin, and
+          # the merged result is only printed after the compile.
+          for f in openwrt/target/linux/generic/config-6.18 \
+                   openwrt/target/linux/zte/config-6.18 \
+                   openwrt/target/linux/zte/zx279133/config-6.18; do
+            if [ -f "$f" ]; then
+              sed -i "s|^${DEVMEM_OFF}\$|CONFIG_DEVMEM=y|" "$f"
+              if grep -qxF "$DEVMEM_OFF" "$f"; then
+                echo "::error::$f still disables CONFIG_DEVMEM after the edit"; exit 1
+              fi
+              echo "  $f -> $(grep -cx 'CONFIG_DEVMEM=y' "$f") CONFIG_DEVMEM=y line(s)"
+            fi
+          done
+          LEFT=$(grep -rl -x "$DEVMEM_OFF" openwrt/target/linux/generic/config-6.18 \
+                 openwrt/target/linux/zte/config-6.18 openwrt/target/linux/zte/zx279133/config-6.18 2>/dev/null || true)
+          if [ -n "$LEFT" ]; then
+            echo "::error::a fragment still disables CONFIG_DEVMEM, and whichever one merges last wins: $LEFT"
+            exit 1
+          fi
+          SUBCFG=openwrt/target/linux/zte/zx279133/config-6.18
+          if [ ! -f "$SUBCFG" ] || ! grep -qx 'CONFIG_DEVMEM=y' "$SUBCFG"; then
+            echo "::error::no CONFIG_DEVMEM=y in $SUBCFG, the fragment merged last - the clone's layout changed"; exit 1
+          fi
+          # trial-files are RAM-image scaffolding only: a released flashed rootfs
+          # must not carry a script that reboots the board five minutes after boot.
+          # They make the trial readable from one wire - an address on every netdev
+          # the kernel makes, ssh that does not wait for the lan, and a canary reboot
+          # that turns "no answer" into "it booted, this port is not it".
+          if [ "${{ matrix.mode }}" = initramfs ]; then
+            cp -a trial-files/. openwrt/files/
+            chmod 755 openwrt/files/etc/rc.d/* openwrt/files/usr/libexec/* 2>/dev/null || true
+            ls -l openwrt/files/etc/rc.d/ openwrt/files/usr/libexec/ openwrt/files/lib/preinit/
+          fi
+          # zrec reaches the image as a package rather than a files/ overlay, because
+          # it has to be compiled. Assert the overlay landed before defconfig gets a
+          # chance to drop the symbol in silence - the same lesson this file has
+          # already had to write down twice - and assert the mode rule with it: the
+          # RAM image is the recovery image, and a released root must not ship a page
+          # that can erase kernel and root.
+          test -f openwrt/package/utils/zrec/Makefile || {
+            echo "::error::overlays/package/utils/zrec did not reach openwrt/package/utils/zrec"; exit 1; }
+          test -f openwrt/package/utils/rdreg/Makefile || {
+            echo "::error::overlays/package/utils/rdreg did not reach openwrt/package/utils/rdreg"; exit 1; }
+          test -f openwrt/package/utils/rdreg/src/rdreg.c || {
+            echo "::error::rdreg overlay is missing src/rdreg.c"; exit 1; }
+          test -f openwrt/package/utils/mdread/Makefile || {
+            echo "::error::overlays/package/utils/mdread did not reach openwrt/package/utils/mdread"; exit 1; }
+          test -f openwrt/package/utils/mdread/src/mdread.c || {
+            echo "::error::mdread overlay is missing src/mdread.c"; exit 1; }
+          test -f openwrt/package/utils/wrreg/Makefile || {
+            echo "::error::overlays/package/utils/wrreg did not reach openwrt/package/utils/wrreg"; exit 1; }
+          test -f openwrt/package/utils/wrreg/src/wrreg.c || {
+            echo "::error::wrreg overlay is missing src/wrreg.c"; exit 1; }
+          for f in src/zrec.c files/usr/sbin/zrec-run files/usr/libexec/zrec-ops \
+                   files/usr/libexec/zrec-bringup files/lib/preinit/85_zrec \
+                   files/etc/rc.d/S21zrec files/www/zrec/index.html; do
+            test -f "overlays/package/utils/zrec/$f" || {
+              echo "::error::zrec overlay is missing $f"; exit 1; }
+          done
+          grep -q 'INSTALL_BIN) $(PKG_BUILD_DIR)/zrec' openwrt/package/utils/zrec/Makefile || {
+            echo "::error::zrec Makefile no longer installs the compiled binary"; exit 1; }
+          # No .config check here: this step runs before Configure writes .config at all,
+          # and reading a file that does not exist yet is how the first version of this
+          # gate failed the initramfs job while passing the flash one - the flash branch
+          # asked "is the symbol on?", got a grep failure from a missing file, and took
+          # that as agreement. The selection is asserted in the Configure step.
+          # Compile-check zrec with the runner's own gcc, here at two minutes rather
+          # than forty: the package builds only after the cross toolchain exists, and
+          # a missing include or a warning under -Werror would otherwise be discovered
+          # at the end of the one hour this pipeline costs per attempt.
+          # check-zrec.yml goes further and runs the server; this line only makes sure
+          # a red build here is not a typo in a header.
+          gcc -std=gnu11 -O1 -Wall -Wextra -Werror -fsyntax-only \
+            openwrt/package/utils/zrec/src/zrec.c
+          echo "zrec compiles clean against host gcc"
+          # syntax gate, run before spending an hour on it.  A bare `dtc` call is
+          # *not* what the kernel does: scripts/Makefile.lib preprocesses DTS with
+          # cpp first.  Try both, and use cnjn's own (known-good) board file as the
+          # control so a broken harness cannot be mistaken for a broken DTS.
+          set -uo pipefail
+          DTS=$KT/arch/arm64/boot/dts/zte
+          PFX=$KT/scripts/dtc/include-prefixes
+          echo "=== dtc / include paths ==="
+          dtc --version
+          ls -l "$PFX" || echo "MISSING include-prefixes"
+          ls -l "$PFX/dt-bindings/gpio/gpio.h" || echo "MISSING dt-bindings/gpio/gpio.h"
+          gate() {
+            f=$1
+            b=$(basename "$f")
+            echo "::group::DTS gate: $b"
+            # dtc's stderr has to reach the log. Run 56 lost 5 minutes to a gate that said only
+            # "does not compile while sr1010.dts does" and left the actual `Error at line ...`
+            # invisible, because a failing `if dtc ...; then` sent dtc's diagnostics to a stderr
+            # this step never showed. Capture both attempts to files and print them on the way out
+            # - whichever branch fails, the reason must be on screen.
+            if dtc -q -I dts -O dtb -o "/tmp/$b.dtb" \
+                 -i "$DTS" -i "$PFX" -i "$KT/include" "$f" 2>"/tmp/$b.dtc-native.log"; then
+              [ -s "/tmp/$b.dtc-native.log" ] && { echo "dtc native (warnings):"; cat "/tmp/$b.dtc-native.log"; }
+              echo "PASS (dtc native preprocessor)"; echo "::endgroup::"; return 0
+            fi
+            echo "dtc native FAILED, its stderr:"
+            sed 's/^/  /' "/tmp/$b.dtc-native.log"
+            # Use Kbuild-style preprocessing with both GCC and Clang.
+            cpp -nostdinc -undef -x assembler-with-cpp -D__DTS__ \
+                -I "$DTS" -I "$PFX" -I "$KT/include" "$f" -o /tmp/pp.dts 2>/tmp/cpp.log
+            rc=$?
+            if [ $rc -eq 0 ] && dtc -q -I dts -O dtb -o "/tmp/$b.dtb" \
+                 -i "$PFX" -i "$KT/include" /tmp/pp.dts 2>"/tmp/$b.dtc-cpp.log"; then
+              echo "PASS (cpp + dtc, the kernel way)"; echo "::endgroup::"; return 0
+            fi
+            echo "cpp rc=$rc log:"; cat /tmp/cpp.log
+            [ $rc -eq 0 ] && { echo "dtc on the preprocessed file FAILED, its stderr:"; sed 's/^/  /' "/tmp/$b.dtc-cpp.log"; }
+            echo "::endgroup::"; return 1
+          }
+          ours=0; ctl=0
+          gate "$DTS/zx279133-sk-d840n.dts" || ours=1
+          gate "$DTS/zx279133-sr1010.dts"   || ctl=1
+          if [ $ours -ne 0 ]; then
+            if [ $ctl -ne 0 ]; then
+              echo "::warning::dtc gate harness cannot compile any board file - skipping gate"
+            else
+              # The reason goes into an ANNOTATION, not only into the log. Reading an Actions log
+              # needs a logged-in session (both /logs endpoints answer 404 anonymously, measured
+              # 2026-10-19 00:11), while this PC can only reach GitHub as the anonymous shared-exit
+              # client - api.github.com is over quota and the browser session drops connections at
+              # random. The run page's own HTML does carry the annotations, so `curl` of it shows
+              # what dtc said. Run 56 cost 75 minutes of guessing because the gate printed its
+              # reason where nobody watching from here could read it.
+              #
+              # Take the message from the attempt that got FURTHEST, not the first one. Runs 56-60
+              # all reported `...dts:46.1-9 syntax error`, which is dtc's native preprocessor
+              # stopping at the first `#include` - it fails that way for every board file, sr1010
+              # included, and says nothing about our bug. The real one (`393.2-18 Properties must
+              # precede subnodes`) was only in the cpp+dtc log, two lines below, inside a collapsed
+              # group that the log viewer virtualises away. Reading it cost this whole detour.
+              B=zx279133-sk-d840n.dts
+              for L in "/tmp/$B.dtc-cpp.log" /tmp/cpp.log "/tmp/$B.dtc-native.log"; do
+                DTCERR=$(grep -m1 -E 'Error|FATAL|error:' "$L" 2>/dev/null | head -c 220)
+                [ -n "$DTCERR" ] && break
+              done
+              echo "::error::zx279133-sk-d840n.dts does not compile while sr1010.dts does: ${DTCERR:-no dtc message captured in /tmp/$B.dtc-cpp.log, /tmp/cpp.log or /tmp/$B.dtc-native.log}"
+              exit 1
+            fi
+          fi
+          # show the partition order the gate produced, but do not let a missing
+          # match end the step (set -e is on)
+          if [ -f /tmp/zx279133-sk-d840n.dts.dtb ]; then
+            ls -l /tmp/zx279133-sk-d840n.dts.dtb
+            dtc -I dtb -O dts /tmp/zx279133-sk-d840n.dts.dtb | grep -B1 -A2 'label = "root"' || true
+          fi
+
+          # Content gate on the compiled blob. The dtc run above only proves the DTS
+          # compiles; it does not prove the board comes up reachable. These are the
+          # properties that decide that, and each one is a way this board has already
+          # been unreachable in the field:
+          #
+          #   - the ethernet node enabled: with it disabled the kernel registers no
+          #     port, the lan bridge has nothing to bridge, and 02_network's explicit
+          #     `device "eth0"` has nothing to attach to.
+          #   - the mdio bus the PHY hangs off enabled, for the same reason one step
+          #     further out.
+          #   - `root` at partition index 5: the U-Boot env on this board hardcodes
+          #     `root=/dev/mtdblock5` and carries no `mtdparts=` on the cmdline, so
+          #     this DT's partition list is the only thing that decides what mtdblock5
+          #     *is*. Add or drop a partition above root and the board mounts the
+          #     wrong region with no error anyone would notice.
+          #   - native241: root owns the final 241 MiB, without scratch/mtd6.
+          #     Capacity, aliases and every offset are checked on the actual blob.
+          # The content gate below reads the blob this dtc harness compiled, and it opens
+          # with `if [ -f /tmp/zx279133-sk-d840n.dts.dtb ]; then`. An absent blob therefore
+          # skips the entire block and the step still reports success - a gate that did not
+          # run, on a release whose note claims it did.
+          #
+          # A missing blob only happens when the harness cannot compile ANY board file,
+          # because the sr1010 control goes through the same harness. That is an environment
+          # fault rather than a DTS fault, which is true, and it is still not a licence to
+          # certify a gate that never ran. So make it fatal here, the same way the
+          # main-compatible check above already is.
+          #
+          # Until this existed, the only evidence that the content gate ran in CI was a step
+          # reporting success - which is exactly the shape a skip also produces. run 25 and
+          # run 26 both passed, so the blob was present in practice; nothing in the workflow
+          # guaranteed it.
+          if [ ! -f /tmp/zx279133-sk-d840n.dts.dtb ]; then
+            echo "::error::the dtc harness produced no board blob, so the DTS content gate did not run"
+            exit 1
+          fi
+          if [ -f /tmp/zx279133-sk-d840n.dts.dtb ]; then
+            dtc -I dtb -O dts -o /tmp/sk-d840n-gate.dts /tmp/zx279133-sk-d840n.dts.dtb
+            # dtc writes a string LIST as ONE quoted run with a literal backslash-zero
+            # between entries:
+            #     compatible = "skyworth,sk-d840n\0zte,zx279133";
+            # The root-compatible assertion below looks for
+            #     compatible = "skyworth,sk-d840n"
+            # complete with its closing quote, and that spelling does not contain one. On
+            # the real compiled blob the assertion therefore fails, `need` returns 1, and
+            # line "[ $rc -eq 0 ] || exit 1" kills this step - which runs before Compile,
+            # so the whole run dies having produced nothing.
+            #
+            # It never fired only because this gate is newer than the last release, so it
+            # had not run yet. Normalise the backslash-zero form into the comma form once,
+            # and run every assertion against that. Single-string properties are untouched
+            # by the substitution.
+            sed 's/\\0/", "/g' /tmp/sk-d840n-gate.dts >/tmp/sk-d840n-gate.norm.dts
+            # print one named node so a failure names the node, not a line number.
+            # NOTE: this matches the FIRST node whose header matches, so it must
+            # not be used to look for a property repeated across siblings (every
+            # partition@ would resolve to partition@0). Partitions are handled by
+            # index below instead.
+            node_block() {
+              awk -v pat="$1" '$0 ~ pat {f=1} f{print} f && /^[[:space:]]*};/ {exit}' /tmp/sk-d840n-gate.norm.dts
+            }
+            need() { # $1=label $2=pattern $3=node-header-regex
+              if node_block "$3" | grep -qE "$2"; then
+                echo "ok   $1"
+              else
+                echo "::error::$1 -- expected a node matching /$3/ to contain /$2/"
+                node_block "$3" | sed 's/^/      /'
+                return 1
+              fi
+            }
+            rc=0
+            # root compatible: first entry is what board_detect/02_sysinfo turn into
+            # board_name, which fwtool.sh then compares against the image name. It is a
+            # list, and only the FIRST entry is the board name.
+            need "dtb root compatible names this board" \
+                 'compatible = "skyworth,sk-d840n"' '^/ \{' || rc=1
+            need "ethernet node is enabled" \
+                 'status = "okay"' 'ethernet@[0-9a-f]+ \{' || rc=1
+            need "ethernet node binds the nppt driver" \
+                 'compatible = "zte,zx279133-nppt"' 'ethernet@[0-9a-f]+ \{' || rc=1
+            # The link is fixed. node_block stops at the first `};`, which is now the
+            # fixed-link child's own brace, and that still covers every property of the
+            # ethernet node because dtc's flattener writes a node's properties before it
+            # writes any child - so `status = "okay"` above and a hypothetical stray
+            # `phy-handle` below are both inside the block it returns. Both halves are
+            # asserted against the compiled blob because the board has repeatedly
+            # disagreed with the DTS: phylink reaches MLO_AN_FIXED only through a
+            # `fixed-link` child of THIS node, and while MLO_AN_FIXED is set a stray
+            # `phy-handle` is dead text - but the day someone re-adds one beside a
+            # reverted phy-mode, phy_attach_direct() -> phy_init_hw() soft-resets the
+            # RTL8226B out of the configuration U-Boot left, and the lane goes silent
+            # again with no hint in the file. Say it in the gate, not in a comment.
+            need "ethernet node declares a fixed link" \
+                 'fixed-link' 'ethernet@19000000 \{' || rc=1
+            if node_block 'ethernet@19000000 \{' | grep -q 'phy-handle'; then
+              echo "::error::the compiled nppt node carries phy-handle beside fixed-link"
+              node_block 'ethernet@19000000 \{' | sed 's/^/      /'
+              exit 1
+            fi
+            echo "ok   compiled nppt has no phy-handle for phylib to attach"
+            need "mdio bus is enabled" \
+                 'status = "okay"' 'mdio@[0-9a-f]+ \{' || rc=1
+            # "enabled" alone is not a discriminating check: the vendor dtb also
+            # has enabled mdio nodes. It is the *mainline* compatible that shows
+            # this node is the one the mainline driver will bind.
+            need "mdio bus binds the mainline mdio driver" \
+                 'compatible = "zte,zx279133-mdio"' 'mdio@[0-9a-f]+ \{' || rc=1
+            # Partition order, asserted by position rather than by label presence.
+            # The U-Boot env on this board hardcodes `root=/dev/mtdblock5` and has
+            # no `mtdparts=` on the cmdline, so this DT's partition list alone
+            # decides what mtdblock5 is. mtd1..mtd5 map to entries 1..5 here.
+            LABELS=$(awk '/^[[:space:]]*partition@[0-9a-f]+ \{/ {inp=1; next}
+                             inp && /label = / {gsub(/^.*label = /, ""); gsub(/;.*$/, ""); print; inp=0}
+                             inp && /^[[:space:]]*\};/ {inp=0}' /tmp/sk-d840n-gate.norm.dts)
+            echo "     partitions in order: $(echo "$LABELS" | tr '\n' ' ')"
+            WANT='"boot" "kernel" "dtb" "parameter tags" "root"'
+            GOT=$(echo "$LABELS" | tr '\n' ' ')
+            if [ "$(echo "$GOT" | sed 's/[[:space:]]*$//')" = "$WANT" ]; then
+              echo "ok   partition order matches, so mtdblock5 == root"
+            else
+              echo "::error::partition order is wrong - U-Boot hardcodes root=/dev/mtdblock5"
+              echo "::error::  want: $WANT"
+              echo "::error::  got : $GOT"
+              rc=1
+            fi
+            [ "$rc" -eq 0 ] || exit 1
+          fi
+          python3 tools/dtbparts.py /tmp/zx279133-sk-d840n.dts.dtb layout=native241 root=0xf00000,0xf100000
+
+      - name: "Gate: declared LED topology and software negative controls"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -uo pipefail
+          set +e
+          {
+            python3 tools/check-sk-lan1-led.py --dtb /tmp/zx279133-sk-d840n.dts.dtb &&
+            python3 tests/test_sk_lan1_led.py --dtb /tmp/zx279133-sk-d840n.dts.dtb
+          } 2>&1 | tee sk-panel-led-gate.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            message=$(tail -n 65 sk-panel-led-gate.log | python3 -c 'import sys; s=sys.stdin.read()[-6000:]; print(s.replace("%","%25").replace("\r","").replace("\n","%0A"))')
+            echo "::error::Panel LED gate failed: $message"
+          fi
+          exit "$rc"
+
+      # This is its own step on purpose.  GitHub Actions refuses a workflow
+      # whose single `run:` script is longer than 21000 characters, and the
+      # "Apply SK-D840N overlays" step is already close to that: run 95 was
+      # rejected as "Invalid workflow file ... Exceeded max expression length
+      # 21000" because this check was appended to it, and the build never
+      # started at all.  A step of its own keeps both facts true.
+      - name: "Gate: every header the 9132 driver includes exists"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -e
+          KT="$KERNEL_SOURCE_DIR"
+          DRV=$KT/drivers/net/ethernet/zte/zx279133-switch.c
+          test -f "$DRV" || { echo "::error::the 9132 driver did not reach the tree"; exit 1; }
+          # This tree is not upstream: there is no include/linux/netdev.h and
+          # no include/linux/switchdev.h (the switchdev one is
+          # net/switchdev.h here).  A missing include is a fatal error the
+          # compiler reports as "No such file or directory", on the first
+          # line of that file's diagnostics - which the failure annotations
+          # used to throw away with a tail, so runs 88, 89, 91 and 92 all
+          # failed with nothing but the make chain.  Checking the includes
+          # costs a second and saves an hour.
+          bad=0
+          for inc in $(grep -oaE '#include <[^>]+>' "$DRV" |
+                       sed -e 's/#include <//' -e 's/>//' | sort -u); do
+            if [ ! -f "$KT/include/$inc" ] && [ ! -f "$KT/arch/arm64/include/$inc" ] &&
+               [ ! -f "$KT/include/uapi/$inc" ]; then
+              echo "::error::zx279133-switch.c includes <$inc>, which this tree does not have"
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] || exit 1
+          echo "every header the 9132 driver includes is present in the tree"
+
+      # Run 124's lesson: a macro can exist and still be invisible.
+      #
+      # Run 124 spent 78 minutes to fail with nine lines of
+      # "ZX279133_SMAC_COUNT undeclared" in zx279133-switch.c.  The macro was
+      # there, in zx279133.h, in the tree - and switch.c never included that
+      # header, so it could not see it.  The five other driver files do
+      # include it, so they compiled, and the gate above (which only checks
+      # that included headers exist) passed.  Nothing in the build noticed
+      # until the compiler did, one hour in.
+      #
+      # So the check is about reachability, not existence: follow each
+      # driver's #include graph, collect the ZX279133_* macros those headers
+      # define, and report the ones a source uses without being able to see
+      # them.  It runs against the tree with the overlay already copied in,
+      # because that is where the two sets have to meet.
+      # The gate is the one thing in this pipeline that can say "no" to a
+      # build, so it has to be right itself.  Runs 124, 125 and 126 each
+      # died on it, in three different ways, and each of those ways was a
+      # bug in the gate rather than in the driver:
+      #
+      #   124: the gate did not exist yet.
+      #   125: its include walk recursed until Python gave up.
+      #   126: it called seventy-one enum members undefined, because it only
+      #         knew about #define, and failed a build over a driver that
+      #         compiles perfectly well.
+      #
+      # So the gate's own test runs first, on every build, and the test is
+      # in the repository - the fixture used to live outside it, which is
+      # why none of the three bugs was caught before it cost an hour.
+      - name: "Gate: the macro gate is right about macros and enum members"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -e
+          python3 tools/test-macrocheck.py
+
+      - name: "Gate: every macro the 9132 driver uses is reachable"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -e
+          KT="$KERNEL_SOURCE_DIR"
+          # The problem list goes into the annotation, not only into the job
+          # log: the Actions log endpoints answer 404 to an anonymous
+          # client, so a failure that can only be read there is a failure
+          # that costs the next hour to understand.
+          #
+          # The exit code is kept, not the pipeline's: the gate can fail
+          # either by finding a problem or by dying, and both have to stop
+          # the build.  A `| tee` would hide the second one.
+          set +e
+          python3 tools/macrocheck.py "$KT" > /tmp/macrocheck.txt 2>&1
+          rc=$?
+          set -e
+          cat /tmp/macrocheck.txt
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^  ' /tmp/macrocheck.txt | head -20 | while read -r l; do
+              echo "::error::$l"
+            done
+            echo "::error::a driver file uses a macro it cannot see - see above"
+            exit 1
+          fi
+          echo "every ZX279133_* name a driver file uses is reachable for it"
+          echo "and every member of the tree's own enums that a driver file names is in the tree"
+
+      - name: Cache dl/
+        if: steps.pick.outputs.run == 'true' && inputs.clean_cache != 'true'
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: skd840n-dl-${{ matrix.mode }}-${{ hashFiles('configs/*.config', 'overlays/**') }}
+          restore-keys: skd840n-dl-
+
+      - name: Install feeds
+        if: steps.pick.outputs.run == 'true'
+        working-directory: openwrt
+        # A clone that stalls must fail, not wait: git has no default
+        # timeout, and a feed that half-arrives leaves the build that
+        # follows it waiting on a tree that never finishes arriving.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: 1000
+          GIT_HTTP_LOW_SPEED_TIME: 60
+          GIT_TERMINAL_PROMPT: 0
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set +e
+          (
+            set -e
+            sh scripts/prepare-sk-d840n-ui.sh "$GITHUB_WORKSPACE/openwrt"
+            sh scripts/configure-sk-d840n.sh \
+              "$GITHUB_WORKSPACE/openwrt" \
+              "$GITHUB_WORKSPACE/$KERNEL_SOURCE_DIR" \
+              "${{ matrix.mode }}"
+          ) 2>&1 | tee sk-configure.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            message=$(tail -n 65 sk-configure.log | python3 -c 'import sys; s=sys.stdin.read()[-2600:]; print(s.replace("%","%25").replace("\r","").replace("\n","%0A"))')
+            echo "::error::$message"
+            exit "$rc"
+          fi
+          set -e
+          # Only now does .config exist, and the mode is what decides the rule: the RAM
+          # image is the recovery image, a released root must not ship a page that can
+          # erase kernel and root. The script asserts the symbol resolved at all; this
+          # asserts it resolved the way this mode asked, which is the half a single
+          # script cannot see.
+          if [ "${{ matrix.mode }}" = initramfs ]; then
+            grep -qx 'CONFIG_PACKAGE_zrec=y' openwrt/.config || {
+              echo "::error::initramfs mode does not select zrec" >&2
+              grep -i zrec openwrt/.config || echo "(no zrec line at all)" >&2
+              exit 1; }
+          elif grep -qx 'CONFIG_PACKAGE_zrec=y' openwrt/.config; then
+            echo "::error::flash mode selected zrec - a released root must not ship a flasher" >&2
+            exit 1
+          fi
+          grep -i zrec openwrt/.config || true
+
+      - name: Download packages
+        if: steps.pick.outputs.run == 'true'
+        working-directory: openwrt
+        # The same transfer limits the Compile step has: scripts/download.pl
+        # gives curl and wget a connect timeout but no limit on the
+        # transfer itself, so a mirror that accepts the connection and then
+        # stops sending leaves this step waiting forever.
+        env:
+          CURL_OPTIONS: --speed-limit 100 --speed-time 120
+          WGET_OPTIONS: --read-timeout=120 --timeout=120
+        run: |
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile
+        id: compile
+        if: steps.pick.outputs.run == 'true'
+        working-directory: openwrt
+        # A build that hangs must not cost the whole job.
+        #
+        # Run 168 sat in this step for 5h53m in BOTH matrix jobs and was
+        # killed by the job's own 6h limit with nothing to show for it: the
+        # step was reported as "cancelled", which says nothing about whether
+        # the compile was slow, stuck on a fetch, or out of memory.  A step
+        # timeout names the step that stopped, and leaves the other matrix
+        # job's result alone.
+        #
+        # Run 169 sat in it for more than three hours and was killed by the
+        # 200 minute ceiling - and the ceiling took the retry with it,
+        # because the retry is inside this step.  So the ceilings are inside
+        # the step now: the first pass, then the retry, then the diagnostic
+        # pass, and the step's own limit is the sum of them with a margin.
+        #
+        # The numbers come from what this build has been measured at on this
+        # runner: 33 to 69 minutes (runs 160 to 167).  The first pass is
+        # allowed 90 minutes - above the worst good run, and below the point
+        # where a run that is stuck stops being worth waiting for, because
+        # the watchdog stops a build that has stopped making progress long
+        # before that.  The retry gets 40 minutes, which is what the part of
+        # the tree that is left needs when a pass is killed near its end.
+        timeout-minutes: 360
+        # A fetch that stalls must fail, not wait.
+        #
+        # git has no default timeout: a half-open connection to a package
+        # mirror leaves `make` blocked forever, which is the shape of a
+        # six-hour build with no output.  These make the transfer give up
+        # after a minute of under 1 KB/s, so the build fails and can be
+        # retried instead of hanging.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: 1000
+          GIT_HTTP_LOW_SPEED_TIME: 60
+          GIT_TERMINAL_PROMPT: 0
+          # A transfer that has connected and then gone quiet must fail, not
+          # wait.  scripts/download.pl gives curl and wget a connect timeout
+          # but no limit on the transfer itself, so a mirror that accepts the
+          # connection and stops sending leaves the build waiting forever -
+          # and a build that waits forever looks exactly like a slow one, from
+          # the outside and from every channel this machine can read.
+          #
+          # These are the two variables download.pl already reads, so no file
+          # in the tree has to be touched: a transfer that stays under 100
+          # bytes a second for two minutes is given up on, and the build says
+          # which URL it was waiting for.
+          CURL_OPTIONS: --speed-limit 100 --speed-time 120
+          WGET_OPTIONS: --read-timeout=120 --timeout=120
+        # The serial retry is what names the failing file, so it is the pass worth keeping.
+        # It is tee'd and its diagnostics are re-emitted as ::error:: lines because a workflow log
+        # is 403 without a token on this machine - and a build that costs 80 minutes and returns
+        # "Process completed with exit code 2" over the only channel that can be read anonymously
+        # (check-run annotations) is an 80-minute guess. Escaping follows the workflow-command rules:
+        # % first, then #, and no newline can survive into the message.
+        run: |
+          set -o pipefail
+          # `|| rc=$?` on both makes, not on neither. The default shell for a `run:` block is
+          # `bash --noprofile --norc -eo pipefail`, and `-e` ends the step at the first failing
+          # simple command - so the previous shape (`make ... | tee log` then `rc=$?`) never ran
+          # its own next line, and runs 63 through 66 died with nothing but GitHub's own
+          # "Process completed with exit code 2". An 80-minute build that cannot say which file
+          # broke is the thing this step exists to prevent, so every status has to be captured in
+          # a form `-e` is obliged to leave alone.
+          rc=0
+          # The disk has to hold the tree.  A build that runs out of space
+          # does not fail cleanly - it stalls in the middle of a write - so
+          # the number is stated before the build starts rather than
+          # inferred from a hang.
+          echo "::notice::the build starts with $(df -BG . | tail -1 | awk '{print $4}') free"
+          # The watchdog below reports through the job log and
+          # compile-watchdog.log only.  It used to push a ci-progress/<run>-<mode>
+          # branch per run; that was removed because the branches piled up.
+          # What the build is doing, and when it stops doing it.
+          #
+          # Runs 168 and 169 both sat in this step until a ceiling took them and
+          # left nothing behind - no log, no artifact, no annotation - so the
+          # question "where was it" had no answer for five hours.
+          #
+          # A watchdog answers it.  Every two minutes it writes a snapshot of
+          # the process table, the load and the memory to compile-watchdog.log,
+          # and every sixth it says one line out loud as a notice: the
+          # processes that have been running the longest, the package
+          # directories the build has touched lately, and how much memory is
+          # left.  A build that is compiling and a build that is waiting on a
+          # stalled download look completely different in those numbers, and
+          # the stalled one carries the URL in its command line.
+          #
+          # It also WATCHES for the stall, in three ways, because there are
+          # three ways a build can stop and only one of them is silence.
+          #
+          #   1. The build's own log: make prints the target it is working on, so a
+          #      log that has not grown for 20 minutes is a build that is not
+          #      working.  This is the quiet stall.
+          #   2. The files: a build that is working changes files.  A build that
+          #      has changed nothing under build_dir, bin, staging_dir, dl
+          #      or tmp for 30 minutes is not working, whatever it is printing.
+          #   3. The processes: a build that is working has started something in
+          #      the last 15 minutes; a build that has started nothing for 15
+          #      minutes is waiting, not working.
+          #
+          # All three have to agree before the build is stopped, because each
+          # of them on its own has a case where the build is well: a build
+          # compiling one big file is quiet, and a build that is downloading
+          # talks and writes nothing under build_dir.  One further rule is not
+          # the conjunction of the three: nothing written for ninety minutes
+          # whatever it prints, which is the stall that talks.
+          #
+          # The question about the files is "has this file CHANGED", not "was
+          # this file written", and the difference is not academic.  The
+          # install phase of a build copies the root filesystem into place
+          # with cp -a, which keeps the modification time of every file it
+          # copies - so a build that was halfway through installing a root
+          # filesystem looked to the first version of this rule like a build
+          # that had written nothing for forty minutes, and was stopped for
+          # it on run 177, an hour into the build.  The change time of a
+          # copied file is the moment of the copy, because a kernel does not
+          # let a program set it, so the watchdog compares the change time
+          # and not the modification time.
+          #
+          # When it stops the build, the watchdog signals the build's PROCESS
+          # GROUP, because that is the build and everything the build
+          # started.  Signalling only make leaves its children holding the
+          # build's output pipe open, and the step then waits for a pipe
+          # that will never close: the build is dead and the job is not, and
+          # the runner is wasted until the step's own ceiling.
+          #
+          # The watchdog is a file of its own (tools/compile-watchdog.sh) and
+          # the rehearsal (tools/watchdog-dryrun.sh) runs THAT file: a rule
+          # that is rehearsed in one place and shipped in another is a rule
+          # that will be different from the one that was rehearsed, and the
+          # difference is only ever found out in a build that takes an hour.
+          # The rehearsal has a case for the build that writes copies with an
+          # old modification time, because that is the case that was wrong.
+          #
+          # When it decides the build is stuck, the watchdog stops the build
+          # itself, so the step fails, the job ends, and the annotations -
+          # which GitHub only publishes when a job ENDS - say what happened
+          # while the evidence was still there to collect.  A build that is
+          # merely slow keeps writing files and is never stopped.
+          WD=
+          trap 'if [ -n "$WD" ]; then kill "$WD" 2>/dev/null || true; fi' EXIT
+          (
+            bash ../tools/compile-watchdog.sh . ../compile-parallel.log \
+                 ../compile-make.pid ../compile-watchdog.log
+          ) &
+          WD=$!
+          # The first pass is bounded, and everything it prints goes to a
+          # file.
+          #
+          # The file is the point.  A build that stops for two hours says
+          # nothing on the step log that says WHY it stopped, and the
+          # failure artifact only carries openwrt/logs and compile-v1.log -
+          # so the parallel build's own output is written beside them and a
+          # later run can read it.  Runs 168 and 169 both ended with a
+          # Compile that had said nothing for hours, and there was nothing
+          # to read afterwards.
+          #
+          # `timeout` puts the child in its own process group, so the whole
+          # build is signalled and not just make: a compiler left running
+          # after make is gone would keep the runner busy for the rest of
+          # the job.  The status it leaves is 124, which is neither 0 nor
+          # the compiler's own code, so it is worth saying out loud.
+          #
+          # The build is started through a shell that writes its own pid to a
+          # file and then becomes make, so the watchdog above has a pid to
+          # stop when the build stops making progress.  `exec` keeps the pid,
+          # which is the whole trick: the process the watchdog kills IS make.
+          #
+          # The ceiling is 240 minutes, and it is the BACKSTOP, not the
+          # judge.  The good runs of this build took 33 to 69 minutes, but
+          # the runs that hang were killed at 90 minutes while they were
+          # still working - a ceiling that guesses wrong about a slow build
+          # kills the build it was meant to measure.  The watchdog is the
+          # judge: it watches the build work, and it stops a build that has
+          # stopped, whatever the clock says.
+          timeout --kill-after=60s 280m bash -c 'echo $$ > ../compile-make.pid; exec make -j"$(nproc)"' 2>&1 | tee ../compile-parallel.log || rc=$?
+          if [ "$rc" = 0 ]; then exit 0; fi
+          if [ "$rc" = 124 ]; then
+            echo "::warning::the first pass was killed after 280 minutes - it was not slow, it was stuck"
+          fi
+          # The compiler's own message, out of the PARALLEL log.
+          #
+          # This is the one thing a reader of the run page needs, and the
+          # old path could not give it: the compiler says WHY in the first
+          # lines it prints, while the make chain that says WHICH file says
+          # it last.  The serial retry further down digs the reason out of
+          # its own log, but that retry is bounded (ten minutes) and may
+          # never reach the file that broke - run #217 lost its reason
+          # exactly there: its annotations showed "make[11]: *** [.../
+          # zx279133-switch.o] Error 1" and nothing at all about what was
+          # wrong with the file, which cost a whole round to guess.
+          #
+          # The parallel log holds the same compiler output, and it is right
+          # here, so dig it out before anything else is tried.  It goes into
+          # the annotations AND into the job summary: the annotations are
+          # what a machine without a token reads, and the summary has no
+          # ten-lines-per-step ceiling.
+          {
+            grep -naE "fatal error:|\berror:|Error [0-9]+|implicit declaration|undefined reference|undefined symbol|No such file|not defined" \
+              ../compile-parallel.log 2>/dev/null | head -n 12 || true
+          } | while IFS= read -r line; do
+            echo "::error::cc: $(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+          done
+          {
+            echo "### the compiler's own message (the parallel pass's log)"
+            echo
+            echo '```'
+            grep -naE "fatal error:|\berror:|Error [0-9]+|implicit declaration|undefined reference|undefined symbol|No such file|not defined" \
+              ../compile-parallel.log 2>/dev/null | head -n 20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The evidence, while it is still here.  A step that is killed never
+          # reaches the lines that would have said where it was, and a job's
+          # annotations are only published when the job ENDS - so this is the
+          # one chance to say it from inside the step that failed.
+          {
+            echo "--- the parallel pass, its last 12 lines ---"
+            tail -n 12 ../compile-parallel.log 2>/dev/null || true
+            echo "--- the watchdog, its last 25 lines ---"
+            tail -n 25 ../compile-watchdog.log 2>/dev/null || true
+          } | while IFS= read -r line; do
+            echo "::warning::evidence: $(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+          done
+          # A build that was STOPPED - by the watchdog, or by the
+          # ceiling - will stop again on the same tree, and the fifty
+          # minutes the retry and the serial pass would take are fifty
+          # minutes before the annotations are published.  The annotations
+          # are the only channel out of a failed build that this machine
+          # can read, so waiting is exactly the wrong thing to do here.
+          #
+          # A build that FAILED is a different thing: make is incremental,
+          # and the same tree is often one target away from the answer.
+          case "$rc" in
+            124|143)
+              echo "::error::the build was stopped rather than failed (rc=$rc) - a second pass on the same tree would stop in the same place, so the step ends here"
+              exit "$rc"
+              ;;
+          esac
+          echo "::warning::the parallel build failed with rc=$rc - retrying once on the same tree"
+          rc=0
+          timeout --kill-after=60s 40m bash -c 'echo $$ > ../compile-make.pid; exec make -j"$(nproc)"' 2>&1 | tee -a ../compile-parallel.log || rc=$?
+          if [ "$rc" = 0 ]; then
+            echo "::notice::the retry finished the build"
+            exit 0
+          fi
+          # The build failed, and that is the answer this step gives: it ends
+          # with the build's own status, whatever the passes below it do.
+          BUILD_RC=$rc
+          # The diagnostic pass: the kernel, and only the kernel, with the
+          # sub-make's own output switched back on.
+          #
+          # Two things were stacked against this, and together they hid the
+          # reason for runs 224 and 225.  OpenWrt's include/verbose.mk sends
+          # a sub-make's stdout AND stderr to /dev/null unless V=s
+          # (SILENT:>/dev/null 2>&1), so the parallel pass's log held the
+          # make chain and none of the compiler's words - the grep over it
+          # could not find an error that was never written down.  And the
+          # serial pass that would have said it ran "make -j1 V=s" from the
+          # TOP of the tree, which walks the whole OpenWrt target order
+          # again; its ten-minute ceiling took it before it ever reached
+          # the kernel.
+          #
+          # So this pass asks for one target - target/linux/compile - and
+          # the kernel's objects from the first pass are still on the disk,
+          # so it goes straight to the file that broke and prints what the
+          # compiler said about it.
+          timeout --kill-after=60s 25m bash -c 'echo $$ > ../compile-make.pid; exec make -j1 V=s target/linux/compile' 2>&1 | tee ../compile-v1.log || DIAG_RC=$?
+          # A pass that says nothing about an error has not found one: the
+          # failure was somewhere else, and the whole tree gets the same
+          # treatment, with the ceiling it always had.
+          if ! grep -qaE "fatal error:|error:|Error [0-9]+|undefined symbol|implicit declaration" ../compile-v1.log; then
+            echo "::notice::the kernel pass named no error - looking at the whole tree"
+            timeout --kill-after=60s 15m bash -c 'echo $$ > ../compile-make.pid; exec make -j1 V=s' 2>&1 | tee -a ../compile-v1.log || DIAG_RC=$?
+          fi
+          {
+            # The compiler's own message comes FIRST in the log and the make
+            # chain comes LAST, so a `tail` keeps the chain and throws the
+            # reason away.  That is how runs 88, 89, 91 and 92 all came back
+            # with "make[11]: *** [.../zx279133-switch.o] Error 1" and
+            # nothing that said what was wrong with that file: the reason
+            # was a missing include, on a line far above the chain.  Emit the
+            # reason first and the chain after it.
+            #
+            # The pattern carries the capital "Error:" too: the compiler
+            # says "error:" and make says "Error 1", and a pattern that
+            # only knows the lower case misses half of what is in there.
+            grep -naE "fatal error:|\berror:|Error [0-9]+|No such file|undefined reference|undefined symbol|not defined|implicit declaration" \
+              ../compile-v1.log | head -n 10
+            echo "--- and the make chain ---"
+            grep -naE "Error [0-9]+\$|make.*\*\*\*" ../compile-v1.log | tail -n 8
+          } | while IFS= read -r line; do
+            echo "::error::$(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+          done
+          echo "::error::compile rc=$BUILD_RC; last 6 lines: $(tail -n 6 ../compile-v1.log | tr '\n' ' ' | sed -e 's/%/%25/g' -e 's/#/%23/g')"
+          # And the parallel pass's own last words, which is the part
+          # that says WHERE a build that was killed was when it was
+          # killed.
+          #
+          # This is the only channel out of a failed build that this
+          # machine can read: the job log is 403 without a token and
+          # the failure artifact needs a session to download, so a
+          # build that stops for three hours leaves nothing to read
+          # otherwise.  Runs 168 and 169 both ended that way.
+          if [ -s ../compile-parallel.log ]; then
+            {
+              echo "--- the parallel pass, its last 12 lines ---"
+              tail -n 12 ../compile-parallel.log
+            } | while IFS= read -r line; do
+              echo "::error::parallel: $(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+            done
+          fi
+          exit "$BUILD_RC"
+
+      # What the build was doing when it stopped.
+      #
+      # The Compile step's own error annotations are only reached when the
+      # step ends by itself.  A build that is KILLED - by the step's own
+      # timeout - never gets there, and that is exactly the case this step
+      # is for: runs 168 and 169 both sat in Compile until the ceiling took
+      # them, and there was nothing afterwards to say where they were.
+      #
+      # This is also the only channel out of a failed build that a machine
+      # with no token can read: the job log is 403 without one, and the
+      # failure artifact needs a session to download.  The annotations of a
+      # check run are public, so this is what a machine with no token has.
+      - name: What the build was doing when it stopped
+        if: always() && steps.pick.outputs.run == 'true' && steps.compile.outcome == 'failure'
+        run: |
+          set -e
+          if [ -s compile-parallel.log ]; then
+            {
+              echo "--- the parallel pass, its last 20 lines ---"
+              tail -n 20 compile-parallel.log
+            } | while IFS= read -r line; do
+              echo "::error::parallel: $(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+            done
+          else
+            echo "::notice::the parallel pass left no log of its own"
+          fi
+          # And the watchdog's own record, which is the half that says what the
+          # build was actually doing: the log tail says what it was building,
+          # the watchdog says whether it was building it or waiting for it.
+          if [ -s compile-watchdog.log ]; then
+            {
+              echo "--- the watchdog, its last 30 lines ---"
+              tail -n 30 compile-watchdog.log
+            } | while IFS= read -r line; do
+              echo "::error::watchdog: $(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/#/%23/g' | tr -d '\r')"
+            done
+          else
+            echo "::notice::the watchdog left no log of its own"
+          fi
+
+      - name: Assert the kernel really has the PHY driver
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -e
+          # Pinned to $KVER for the same reason the packaging step is: this reads the merged
+          # .config of the kernel that is actually shipped, and a bare `linux-*` glob would
+          # check whatever version directory happened to be there. It is also the one place
+          # where picking wrong would be invisible - a stale config would still answer every
+          # every `grep -qx` question below, just about a kernel nobody ships.
+          KC=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER/.config 2>/dev/null || true; } | head -1 )
+          [ -n "$KC" ] || { echo "::error::no .config for linux-$KVER (KVER=$KVER) under build_dir; what is there:"; ls -d openwrt/build_dir/target-*/linux-* 2>&1 || true; exit 1; }
+          echo "kernel config: $KC"
+          python3 tools/check-sk-lan1-led.py --kernel-config "$KC"
+          python3 tools/check-sk-offload.py --kernel-config "$KC"
+          # Editing target/linux/.../config-6.18 is the supported way to reach the kernel
+          # build, but only the merged result proves it worked - a symbol name that does
+          # not exist is dropped in silence, so every symbol is checked against the kernel's
+          # own .config, not against the file that was edited. Each one failing here would
+          # cost a whole round on the board and look identical to "the kernel does not
+          # boot": no PHY driver means the one reachable port never links; no LEDS_GPIO or
+          # GPIO driver means the panel beacon that replaces a serial console is dark; and
+          # no MAGIC_SYSRQ means a stalled round cannot be told apart from a dead board.
+          # What the failing symbol actually *is* is the whole question, and it has four
+          # different answers that look identical from the outside: =y (it is not, since we
+          # are in the failure branch), =m, an explicit "# ... is not set", or absent from
+          # .config altogether - and the last one means the symbol name does not exist in
+          # this kernel's Kconfig, which defconfig then drops without a word.
+          #
+          # Runs 28/29/30/31 all failed at a step nobody could read back: the run page
+          # carries no step data (its JSON blocks are UI scaffolding), api.github.com
+          # answers 403 from this network, and the logs endpoint 404s. The line printed
+          # here named the symbol but never its state, so the next reader had to go dig.
+          # This changes what is printed and nothing else - the same 13 symbols are still
+          # required to be =y and the step still exits 1. It is not a new gate.
+          dump_config_state() {
+            for k in "$@"; do
+              if grep -qx "CONFIG_$k=y" "$KC"; then
+                printf '    %-34s =y\n' "CONFIG_$k"
+              elif v=$(grep -m1 -E "^(CONFIG_$k=|# CONFIG_$k is not set$)" "$KC"); then
+                printf '    %s\n' "$v"
+              else
+                printf '    %-34s <not mentioned in .config at all>\n' "CONFIG_$k"
+              fi
+            done
+          }
+          # Two lists, because they are not the same kind of failure.
+          #
+          # required: without these the board cannot be reached or read at all, and a
+          # missing one looks exactly like "the kernel does not boot".
+          #
+          # DYNAMIC_DEBUG is on that list for a reason of its own: the 9132 lane
+          # dump was demoted to dev_dbg() so that the kernel ring buffer stops
+          # filling with fifteen register words every 750 ms, and a dev_dbg() is
+          # compiled to no_printk unless DYNAMIC_DEBUG (or DEBUG) is on.  Without
+          # this symbol the demotion would not make the line switchable, it would
+          # make it disappear - and the line is the primary evidence for the
+          # 2.5G lane's state (docs/92 §96.46.7, §96.47, §96.53).  The recovery is
+          # one command on the board:
+          #
+          #   echo 'file zx279133-switch.c +p' > /sys/kernel/debug/dynamic_debug/control
+          #
+          # so the cost of this entry is a few hundred kilobytes of kernel and one
+          # config symbol, and the cost of leaving it out is silent evidence loss.
+          #
+          # DYNAMIC_DEBUG_CORE is on that list with it because the two gate different
+          # halves of the same feature and neither substitutes for the other:
+          # include/linux/dynamic_debug.h:137 makes a dev_dbg() site runtime
+          # switchable under CONFIG_DYNAMIC_DEBUG, while lib/Makefile builds
+          # lib/dynamic_debug.c - the fs_initcall() at line 1494 that creates
+          # /sys/kernel/debug/dynamic_debug/control - only under
+          # CONFIG_DYNAMIC_DEBUG_CORE.  The Kconfig links them with "select", and a
+          # select loses to an explicit "is not set" in a fragment, which
+          # target/linux/generic/config-6.18:1876 carries.  So CONFIG_DYNAMIC_DEBUG=y
+          # on its own would make this gate green while the control file was never
+          # created and the demoted line was neither switchable nor recoverable -
+          # the exact failure the symbol above was added to prevent.
+          #
+          # reported: bring-up instruments. Worth having, never worth a red run - and
+          # that is not a preference, it is what runs 28/29/30/31 measured: all four
+          # stopped here on CONFIG_DETECT_HUNG_TASK while the phy-mode question that
+          # actually blocks the trial went untested, because no kit was ever produced.
+          # The pin is still attempted; only the blocking is dropped, and the state is
+          # published either way, so nothing is being hidden.
+          #
+          # DEVMEM joins that list for the same reason, measured on runs 42 and 43: the
+          # symbol was pinned, pin_y's own grep on the seed passed (Configure got that
+          # far both times), and the merged .config still had no CONFIG_DEVMEM=y. Two
+          # runs of every artefact - PHY kit and zrec kit alike - died on an instrument
+          # nobody has yet shown how to switch on. The seed/merged pair is printed on
+          # every run below so the next reader gets the answer without another round:
+          # if the seed says =y and the merge says otherwise, the question is which of
+          # the three config-* fragments is last, not whether the pin ran.
+          # -Os keeps every selected feature while fitting the fixed kernel partition.
+          # Check the merged config, not just the two inputs configure pinned.
+          required="CC_OPTIMIZE_FOR_SIZE REALTEK_PHY LEDS_GPIO GPIO_ZX279133 GPIO_SYSFS PSTORE PSTORE_CONSOLE PSTORE_RAM MAGIC_SYSRQ MAGIC_SYSRQ_SERIAL DYNAMIC_DEBUG DYNAMIC_DEBUG_CORE NETFILTER NF_CONNTRACK NF_CONNTRACK_MARK NF_NAT NF_TABLES NF_TABLES_INET NF_TABLES_IPV4 NF_TABLES_IPV6 NFT_CT NFT_NAT NFT_MASQ NFT_REDIR NFT_REJECT NFT_REJECT_INET NFT_REJECT_IPV4 NFT_REJECT_IPV6 NFT_FIB NFT_FIB_INET NFT_FIB_IPV4 NFT_FIB_IPV6 NFT_LOG NFT_LIMIT NFT_QUOTA NFT_NUMGEN NF_FLOW_TABLE NF_FLOW_TABLE_INET NFT_FLOW_OFFLOAD"
+          reported="DEVMEM STRICT_DEVMEM IO_STRICT_DEVMEM DETECT_HUNG_TASK SOFTLOCKUP_DETECTOR IKCONFIG IKCONFIG_PROC NETFILTER NETFILTER_ADVANCED NF_CONNTRACK NF_NAT NF_TABLES NF_TABLES_IPV4 NFT_NAT NFT_MASQ VETH"
+          SEED=$( { ls openwrt/target/linux/zte/zx279133/config-* 2>/dev/null || true; } | head -1 )
+          echo "kernel config seed: ${SEED:-none}"
+          echo "    seed:   $( { grep -E '^(CONFIG_DEVMEM=|# CONFIG_DEVMEM is not set$)' "$SEED" 2>/dev/null || echo 'DEVMEM not mentioned in the seed'; } )"
+          echo "    merged: $( { grep -E '^(CONFIG_DEVMEM=|# CONFIG_DEVMEM is not set$)' "$KC" 2>/dev/null || echo 'DEVMEM not mentioned in the merged config'; } )"
+          for s in $required; do
+            grep -qx "CONFIG_$s=y" "$KC" || {
+              echo "::error::CONFIG_$s is not built into the kernel" >&2
+              echo "    config file: $KC" >&2
+              echo "    --- the failing symbol, on its own ---" >&2
+              dump_config_state "$s" >&2
+              echo "    --- every symbol this gate asserts, as it actually stands ---" >&2
+              dump_config_state $required $reported PANIC_TIMEOUT >&2
+              echo "    --- the Realtek / ZX / MDIO family, as before ---" >&2
+              grep -iE 'CONFIG_(REALTEK|ZX279051|MDIO_ZX|LEDS_GPIO|GPIO_ZX|GPIO_SYSFS)' "$KC" >&2 || true
+              exit 1
+            }
+          done
+          grep -qx '# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE is not set' "$KC" || {
+            echo "::error::kernel optimization reverted to -O2" >&2
+            dump_config_state CC_OPTIMIZE_FOR_SIZE CC_OPTIMIZE_FOR_PERFORMANCE >&2
+            exit 1
+          }
+          # One annotation per instrument, carrying the line exactly as the merged config
+          # has it: an instrument that silently did not compile is worse than one that was
+          # never asked for, and annotations are readable without signing in to anything.
+          for s in $reported; do
+            st=$( { grep -m1 -E "^(CONFIG_$s=|# CONFIG_$s is not set$)" "$KC"; } || true )
+            [ -n "$st" ] || st="CONFIG_$s absent from .config - no such symbol, or a dependency turned it off"
+            echo "::warning::$st"
+          done
+          grep -iE '^CONFIG_(ZTE_ZX279133|REALTEK|MDIO_ZX|EXTRA_FIRMWARE)' "$KC"
+          grep -qx 'CONFIG_PANIC_TIMEOUT=0' "$KC" || {
+            echo "CONFIG_PANIC_TIMEOUT is not 0 - a panic would reboot before the console could be read" >&2
+            grep -E '^CONFIG_PANIC_TIMEOUT' "$KC" || echo "no CONFIG_PANIC_TIMEOUT at all" >&2
+            exit 1; }
+          # The built-in command line is the reason the last image waited forever for a root
+          # device that this board never creates, so it is checked in the merged kernel config
+          # rather than in the file that was edited. Searching the kernel *binary* for the old
+          # string would not work: cnjn appends every board dtb to Image, and SR1010's own dtb
+          # legitimately carries mtdblock7.
+          grep -qx 'CONFIG_CMDLINE="console=ttyAMA0,115200n8 root=/dev/mtdblock5 rootfstype=jffs2 ro rootwait clk_ignore_unused pd_ignore_unused"' "$KC" || {
+            echo "CONFIG_CMDLINE is not the pinned cmdline" >&2
+            grep -iE '^CONFIG_CMDLINE' "$KC" || echo "no CONFIG_CMDLINE at all" >&2
+            exit 1; }
+          ! grep -q 'mtdblock7' "$KC" || { echo "a mtdblock7 cmdline is still in the kernel config" >&2; exit 1; }
+          # And the same rule for the flash itself. The Unim entry is added to core.c's
+          # manufacturer array and to spinand-objs by scripts/configure-sk-d840n.sh, both of
+          # which self-report success; only the compiled tree proves the chip will be known
+          # at probe time. If this fails, the board boots to exactly the symptom the patch
+          # exists to remove - no MTD devices, no root device, and one line of evidence that
+          # is only visible on a serial console.
+          # Pinned to $KVER like every other build_dir lookup here, and for the same
+          # reason: this step goes on to grep a compiled kernel, so "whatever version is
+          # in the tree" is the wrong subject. The || true lives INSIDE the substitution
+          # on purpose - under set -euo pipefail a failing ls ends the step before the
+          # refusal below could say anything.
+          KT=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER 2>/dev/null || true; } | head -1 )
+          test -n "$KT" || { echo "::error::no build dir for linux-$KVER (KVER=$KVER); what is there:"; ls -d openwrt/build_dir/target-*/linux-zte_zx279133/* 2>&1 || true; exit 1; }
+          echo "KT: $KT"
+          SPI=$KT/drivers/mtd/nand/spi
+          have=0
+          for blob in "$KT/vmlinux" "$SPI/built-in.a" "$SPI/unim.o"; do
+            if [ -f "$blob" ] && grep -aq UM19A1HISW "$blob"; then
+              echo "spi-nand Unim table is in $blob"
+              have=1
+              break
+            fi
+          done
+          [ "$have" = 1 ] || {
+            echo "UM19A1HISW is not in the built kernel" >&2
+            ls -l "$SPI" 2>/dev/null || echo "no $SPI" >&2
+            exit 1; }
+
+      - name: "Gate: actual kernel and modules have the requested version"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          KT=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER 2>/dev/null || true; } | head -1 )
+          ROOTFS=$( { ls -d openwrt/build_dir/target-*/root-zte 2>/dev/null || true; } | head -1 )
+          test -n "$KT" && test -n "$ROOTFS"
+          python3 tools/prepare-sk-kernel.py --check-built "$KT" --rootfs "$ROOTFS" --version "$KVER"
+          test -x "$ROOTFS/usr/sbin/sk-layout-check"
+          layout=$(qemu-aarch64 -L "$ROOTFS" "$ROOTFS/usr/sbin/sk-layout-check" /tmp/zx279133-sk-d840n.dts.dtb)
+          test "$layout" = native241
+          echo "Target AArch64 layout validator: $layout (including its shipped libfdt)"
+
+      - name: "Gate: ONU UI, protocol service and firewall4 reached the image"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set +e
+          sh scripts/check-sk-d840n-management.sh openwrt 2>&1 | tee sk-management-gate.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            message=$(tail -n 65 sk-management-gate.log | python3 -c 'import sys; s=sys.stdin.read()[-2600:]; print(s.replace("%","%25").replace("\r","").replace("\n","%0A"))')
+            echo "::error::$message"
+          fi
+          exit "$rc"
+
+      - name: "Gate: the recovery service reached the image"
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -e
+          # WHAT THIS STEP IS ALLOWED TO CLAIM, and what it learned the hard way.
+          #
+          # Round 1 globbed build_dir/target-*/rootfs-*, matched nothing, and failed a job
+          # 74 minutes deep over a guessed directory name. Round 2 read the package
+          # archive as *.ipk; this tree is ImmortalWrt with the apk package manager (a
+          # built trial initramfs carries lib/apk/db/installed and lib/apk/packages/*.list
+          # and no lib/opkg), so it found nothing again. Round 3 found the archive -
+          # openwrt/bin/packages/aarch64_cortex-a53/base/zrec-1-r1.apk - and then died on
+          # `tar -xf` of it, because the apk container is not a tar.
+          #
+          # That last one is measured, not assumed: a package pulled from
+          # downloads.openwrt.org/snapshots/packages/x86_64/base/, i.e. written by the same
+          # `apk mkpkg` recipe (include/package-pack.mk:592), starts with the four bytes
+          # 41 44 42 64 ("ADBd") and contains no "ustar", no 1f 8b 08, no xz, zstd, lz4 or
+          # bzip2 magic anywhere in it. GNU tar says "This does not look like a tar
+          # archive". The only tool that reads it is apk itself, and that is not on the
+          # runner. So the archive is reported here and never parsed.
+          #
+          # What IS readable, and is the same bytes, is the tree the packer was handed:
+          # include/package-pack.mk:606 packs `--files $(IDIR)`, IDIR being
+          # build_dir/target-*/zrec-*/ipkg-*/zrec, and that directory is still on disk when
+          # this step runs. Reading it answers presence, install path and mode for exactly
+          # the content that went into the archive. Line 562 of the same file even writes
+          # the package's own file list into $(IDIR)/lib/apk/packages/zrec*.list, so the
+          # packer's claim about what it owns can be compared against the files themselves.
+          # "And it reached the released image" is then carried by the target manifest,
+          # which is generated from the installed package set.
+          want="usr/sbin/zrec usr/sbin/zrec-run usr/libexec/zrec-ops usr/libexec/zrec-bringup lib/preinit/85_zrec etc/rc.d/S21zrec www/zrec/index.html"
+          noexec="www/zrec/index.html lib/preinit/85_zrec"
+          PKG=$( { find openwrt/bin openwrt/build_dir -name 'zrec*' \( -name '*.apk' -o -name '*.ipk' \) 2>/dev/null || true; } | sort | head -1)
+          MAN=$( { find openwrt/bin/targets -maxdepth 3 -name '*manifest*' 2>/dev/null || true; } | sort | head -1)
+          # IDIR is located by what it contains, not by a name pattern: every package has an
+          # ipkg-<arch> directory, so asking which one holds usr/sbin/zrec is a question the
+          # tree can answer, and a rename of the build directory cannot make this silently
+          # match nothing.
+          ID=""
+          for c in $( { find openwrt/build_dir -type d -name 'ipkg-*' 2>/dev/null || true; } | sort); do
+            for p in "$c" "$c/zrec"; do
+              [ -f "$p/usr/sbin/zrec" ] && ID=$p
+            done
+          done
+          echo "package: ${PKG:-none}  manifest: ${MAN:-none}  packed tree: ${ID:-none}"
+          if [ "${{ matrix.mode }}" = initramfs ]; then
+            test -n "$ID" || {
+              echo "::error::nothing under build_dir holds usr/sbin/zrec, so zrec was never packed into the RAM image" >&2
+              echo "--- every ipkg-* directory in build_dir ---" >&2
+              find openwrt/build_dir -type d -name 'ipkg-*' 2>/dev/null | head -40 >&2 || true
+              echo "--- anything named zrec anywhere ---" >&2
+              find openwrt/build_dir openwrt/bin -maxdepth 5 -name 'zrec*' 2>/dev/null >&2 || true
+              exit 1; }
+            for f in $want; do
+              test -f "$ID/$f" || { echo "::error::$f is not in the tree that was packed"; exit 1; }
+            done
+            for f in $want; do
+              case " $noexec " in *" $f "*) continue ;; esac
+              test -x "$ID/$f" || { echo "::error::$f lost its exec bit ($(ls -l "$ID/$f"))"; exit 1; }
+            done
+            # The page is opened by absolute path inside the binary, so a wrong install
+            # location is a 404 in the browser and nothing in the build log would say so.
+            grep -aq '/www/zrec/index.html' "$ID/usr/sbin/zrec" || {
+              echo "::error::the compiled zrec does not reference /www/zrec/index.html"; exit 1; }
+            # The packer's own ownership list has to agree with the files that are on disk,
+            # otherwise "the file was staged" and "the file is in the package" are different
+            # claims again - which is the whole reason this step exists.
+            LST=$( { find "$ID/lib/apk/packages" -maxdepth 1 -name 'zrec*.list' 2>/dev/null || true; } | head -1)
+            test -n "$LST" || {
+              echo "::error::$ID has no lib/apk/packages/zrec*.list, so apk was never told what zrec owns"; exit 1; }
+            for f in $want; do
+              grep -q "^/$f\$" "$LST" || {
+                echo "::error::$f is on disk but not in the package file list $LST"; exit 1; }
+            done
+            # And this is the entry point that actually runs: a RAM image that cannot mount a
+            # root ends at the failsafe shell and never execs procd, so an /etc/rc.d script
+            # alone would simply not be part of the boot.
+            P="$ID/lib/preinit/85_zrec"
+            grep -q 'boot_hook_add failsafe zrec_recovery' "$P" || {
+              echo "::error::85_zrec does not register the failsafe hook - nothing would start zrec"; exit 1; }
+            grep -q 'boot_hook_add preinit_main zrec_recovery' "$P" || {
+              echo "::error::85_zrec does not register preinit_main"; exit 1; }
+            grep -q 'zrec-bringup' "$P" || {
+              echo "::error::85_zrec no longer calls zrec-bringup"; exit 1; }
+            # A preinit file is sourced by the init script: broken syntax there is a
+            # board that stops booting, and the failure looks exactly like a bad kernel.
+            sh -n "$P"
+            sh -n "$ID/usr/libexec/zrec-bringup"
+            sh -n "$ID/etc/rc.d/S21zrec"
+            # Report the archive without reading it: its name and size are the difference
+            # between "the package was installed into the image set" and "the files were
+            # staged and then skipped by the packer".
+            if [ -n "$PKG" ]; then
+              ls -l "$PKG"
+            else
+              echo "::warning::no zrec package archive was found, even though the packed tree is there"
+            fi
+            if [ -n "$MAN" ]; then
+              grep -qw zrec "$MAN" || {
+                echo "::error::zrec is staged but not in the image manifest" >&2
+                head -5 "$MAN"; exit 1; }
+              echo "manifest says the image installs zrec: $(grep -aw zrec "$MAN" | head -1)"
+            else
+              echo "::warning::no target manifest to check zrec against"
+            fi
+            echo "recovery service is staged, listed and packaged for the RAM image"
+          else
+            if [ -n "$PKG" ] || [ -n "$ID" ]; then
+              echo "::error::flash mode built a zrec package - a released root must not ship a flasher" >&2
+              echo "package: ${PKG:-none}  packed tree: ${ID:-none}"
+              exit 1
+            fi
+            if [ -n "$MAN" ] && grep -qw zrec "$MAN"; then
+              echo "::error::the flash rootfs manifest selects zrec"; exit 1
+            fi
+            echo "flash mode produced no zrec, as intended"
+          fi
+
+      - name: Package flash images
+        id: package_flash
+        if: steps.pick.outputs.run == 'true' && matrix.mode == 'flash'
+        run: |
+          set -euo pipefail
+          KT=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER 2>/dev/null || true; } | head -1 )
+          test -n "$KT" || { echo "::error::no build dir for linux-$KVER"; exit 1; }
+          RAW="$KT/arch/arm64/boot/Image"
+          test -f "$RAW"
+          # OpenWrt has already made the Zopfli uImage, sysupgrade tar and
+          # native metadata/signature. Validate that exact image and export its
+          # members verbatim: there is no second compressor or mkimage here.
+          python3 tools/check_sysupgrade.py \
+            --source-dir openwrt/bin/targets/zte/zx279133 \
+            --raw-kernel "$RAW" \
+            --fwtool openwrt/staging_dir/host/bin/fwtool \
+            --export-dir .
+          RS=flash-rootfs.jffs2
+          # THE NAT RULE HAS TO BE IN THE IMAGE, not only in the tree.  A
+          # rootfs without it is a board that boots, serves LuCI and cannot
+          # route, and the only way to know which one was built is to look
+          # inside the image.
+          #
+          # HOW THE IMAGE IS ASKED.  jffs2 compresses the CONTENTS of a file
+          # but not its NAME: the directory entry that carries the name is
+          # stored as it is.  So the names are read out of the image and the
+          # question is asked about names - and not about bytes.
+          #
+          # The way this used to be asked was `strings "$RS" | grep -qx
+          # 'sk-nat'`, and that question is wrong twice over.  `strings`
+          # prints the printable runs of the file, and the name sits between
+          # binary bytes, so it never lands on a line of its own: measured on
+          # the rootfs of run 166, `strings | grep -cx 'init.d'` is 0 while
+          # the file is in the image - and the second check looked for
+          # "sk-nat.log", which is the name of the file the old uci-defaults
+          # redirected its output into: a word in a comment, in a file the
+          # build deletes, in a file whose contents jffs2 compresses.
+          #
+          # So run 180 built a good image and this gate refused it.  What the
+          # gate asks now:
+          #
+          #   sk-nat         the init script itself, by its exact name;
+          #   S96sk-nat      the rc.d link that starts it, if the build ran
+          #   99-sk-nat      the uci-defaults that makes the link, if the
+          #                  build did not - one of the two has to be there,
+          #                  or the script never runs.
+          python3 tools/jffs2names.py --list "$RS" > rootfs-names.txt
+          grep -qx 'sk-layout-check' rootfs-names.txt || {
+            echo "::error::released rootfs lacks the mandatory layout validator"; exit 1; }
+          echo "rootfs: $(wc -l < rootfs-names.txt) names in the image"
+          grep -qx 'sk-nat' rootfs-names.txt || {
+            echo "::error::the built rootfs does not contain sk-nat - the flashed image would not masquerade"; exit 1; }
+          if ! grep -qx -e 'S96sk-nat' -e '99-sk-nat' rootfs-names.txt; then
+            echo "::error::the built rootfs has the sk-nat script but nothing that starts it - neither the rc.d link nor the uci-defaults is in the image"
+            grep -i 'nat' rootfs-names.txt || echo "(the image holds no name with 'nat' in it)"
+            exit 1
+          fi
+          echo "rootfs: it carries the NAT rule"
+          grep -x -e 'sk-nat' -e 'S96sk-nat' -e '99-sk-nat' rootfs-names.txt || true
+          cp templates/flash-sk-d840n.sh flash-sk-d840n.sh
+          # The maintenance manifest retains its existing filenames; the direct
+          # download has its own checksum, without duplicating the bin in the tgz.
+          sha256sum immortalwrt-sk-d840n-sysupgrade.bin > immortalwrt-sk-d840n-sysupgrade.bin.sha256
+          sha256sum flash-uImage flash-dtb.bin flash-rootfs.jffs2 \
+            flash-sysupgrade.bin flash-sk-d840n.sh > sha256sums-release
+          sha256sum -c immortalwrt-sk-d840n-sysupgrade.bin.sha256
+          sha256sum -c sha256sums-release
+          mkdir -p flash-set
+          cp flash-uImage flash-dtb.bin flash-rootfs.jffs2 flash-sysupgrade.bin \
+            flash-sk-d840n.sh sha256sums-release flash-set/
+          tar czf flash-set.tgz -C flash-set .
+          VERIFY_DIR=$(mktemp -d)
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
+          tar xzf flash-set.tgz -C "$VERIFY_DIR"
+          ( cd "$VERIFY_DIR" && sha256sum -c sha256sums-release )
+          echo "validated=true" >> "$GITHUB_OUTPUT"
+
+      - name: "Gate: every dtb compatible has a driver in this kernel"
+        if: steps.pick.outputs.run == 'true' && matrix.mode == 'flash'
+        run: |
+          set -euo pipefail
+          # Pinned to $KVER, not a bare `linux-*` glob. The glob matched whatever the build
+          # happened to leave in that directory, so a stale or unexpected version directory
+          # would be packaged and gated while the release text still named $KVER - the same
+          # shape as the dtb one ("check something other than what you ship"), one level up.
+          # The `|| true` lives inside the substitution on purpose: under `set -euo pipefail`
+          # a failed `ls` would end the step before the check below could say anything.
+          KT=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER 2>/dev/null || true; } | head -1 )
+          test -n "$KT" || { echo "::error::no build dir for linux-$KVER (KVER=$KVER); what is there:"; ls -d openwrt/build_dir/target-*/linux-zte_zx279133/* 2>&1 || true; exit 1; }
+          echo "KT: $KT"
+          IMG="$KT/arch/arm64/boot/Image.gz"
+          [ -f "$IMG" ] || IMG="$KT/arch/arm64/boot/Image"
+          test -f "$IMG"
+          # Check the artifact that will actually ship.
+          #
+          # "Package flash images" runs immediately before this step and leaves
+          # flash-dtb.bin in the working directory - that byte stream is what reaches the
+          # board. OpenWrt also stages its own copy under build_dir, and OpenWrt patches
+          # dtbs on its way to an image, so "some file whose name matches *sk-d840n*.dtb" is
+          # not the same claim as "the dtb we ship". A gate that inspects one copy while the
+          # release carries another is exactly the kind of thing that passes and means
+          # nothing. Prefer the shipped file; fall back to the kernel tree only in initramfs
+          # mode, where no flash-dtb.bin exists.
+          DTB=
+          if [ -f flash-dtb.bin ]; then
+            DTB=flash-dtb.bin
+          else
+            DTB=$(find "$KT/arch/arm64/boot/dts/zte" -name '*sk-d840n*.dtb' 2>/dev/null | head -1)
+          fi
+          test -n "$DTB" || { echo "::error::no sk-d840n dtb to check"; exit 1; }
+          echo "kernel: $IMG"
+          echo "dtb   : $DTB  ($(sha256sum "$DTB" | cut -c1-16)...)"
+          python3 tools/check-sk-lan1-led.py --dtb "$DTB"
+
+          # A device tree node whose `compatible` names a driver that was not built is
+          # SKIPPED SILENTLY by the kernel: the board boots, logs nothing wrong, and
+          # simply has no network port. The dtb content gate above only proves the DTS
+          # compiles, and the config gate above only proves some CONFIG symbols are
+          # set - neither can see a compatible with no driver behind it. This one can.
+          #
+          # Verified before being added, against the real pairing and a wrong one:
+          #   our dtb + this kernel      -> pass (25 compatibles accounted for)
+          #   vendor dtb + this kernel   -> fail, naming the drivers that are absent
+          # The vendor run is what makes this a gate rather than decoration: it is
+          # rejected for zte,zx279133-pon, -se-ddr and -woe-ddr.
+          WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+          dtc -I dtb -O dts -o "$WORK/dts" "$DTB"
+
+          # Pipe-separated, never tab: this is a YAML block scalar.
+          awk '
+            function flush() {
+              if (name != "") printf "%s|%s|%s|%s\n", name, node, (fb != "" ? fb : "-"), st
+              name = ""; fb = ""
+            }
+            /^[[:space:]]*[A-Za-z0-9_,@-]+[[:space:]]*\{/ {
+              line = $0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*\{.*$/, "", line)
+              node = line; st = "-"
+            }
+            /^[[:space:]]*compatible[[:space:]]*=/ {
+              # dtc writes a string LIST as ONE quoted run with a literal backslash-zero
+              # between entries:
+              #     compatible = "zte,zx279133-topcrm\0syscon";
+              # Splitting the line on `"` alone therefore yields the single token
+              # "zte,zx279133-topcrm\0syscon", which matches no zte,zx279133-* pattern,
+              # and the node was dropped from the scan without a word. Every node whose
+              # compatible carries a fallback is exactly such a node, so on this board
+              # that was pon-route, idm-cci, wdt-reset, topcrm, lsp-clk, sfc, efuse and
+              # uart - the gate was not looking at a third of the tree, and the syscon
+              # branch below could not be reached from a real build.
+              #
+              # This was invisible for three reasons. The scan still found 25-something
+              # rows, so the "the scan found nothing - it is broken, not clean" guard
+              # never fired; the offline rehearsal fed this text rendered as "a", "b",
+              # a spelling dtc does not emit; and the whole step did not parse as shell
+              # at all, so none of this was ever reached in a real build.
+              #
+              # DO NOT write an apostrophe anywhere inside this awk program. It is wrapped
+              # in shell single quotes, so the phrase "the gate - own rehearsal" below,
+              # had it kept its apostrophe, would have closed the quote 53 lines early,
+              # and bash would have blamed an innocent gsub() 24 lines further down.
+              # `bash -n` over every run: block is now part of the offline suite
+              # (test_workflow_shell_parses.sh) so this cannot come back.
+              #
+              # Normalise the backslash-zero form into the comma form first, so both
+              # spellings reach the same loop.
+              line = $0; gsub(/\\0/, "\", \"", line)
+              n = split(line, parts, "\"")
+              generic = ""
+              for (i = 2; i <= n; i += 2) {
+                q = parts[i]
+                if (q ~ /^zte,zx279133-[a-z0-9-]+$/) { flush(); name = q }
+                else if (i < n) { generic = q }
+              }
+              fb = generic
+            }
+            /^[[:space:]]*status[[:space:]]*=/ {
+              s = $0; sub(/^[^"]*"/, "", s); sub(/".*$/, "", s); st = s
+            }
+            /^[[:space:]]*\};/ { flush() }
+            END { flush() }
+          ' "$WORK/dts" | LC_ALL=C sort -u >"$WORK/compat.txt"
+
+          total=$(wc -l <"$WORK/compat.txt")
+          echo "     SoC compatibles in the compiled dtb: $total"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::the scan found no zte,zx279133-* compatibles - it is broken, not clean"
+            exit 1
+          fi
+
+          # Whole-string match, never substring. These live NUL-terminated in the
+          # kernel, so a substring search reports zte,zx279133-pon as "present" only
+          # because zte,zx279133-pon-serdes is. Verified: exact=False, substring=True.
+          case "$(od -An -tx1 -N2 "$IMG" | tr -d ' \n')" in
+          1f8b) gzip -dc "$IMG" >"$WORK/img.raw" ;;
+          *)    cat "$IMG" >"$WORK/img.raw" ;;
+          esac
+          test -s "$WORK/img.raw"
+          LC_ALL=C tr -c '[:print:]' '\n' <"$WORK/img.raw" | grep -aE '.{3,}' \
+            | LC_ALL=C sort -u >"$WORK/strings.txt"
+          has_driver() { LC_ALL=C grep -Fxq -e "$1" "$WORK/strings.txt"; }
+
+          rc=0
+          while IFS='|' read -r compat node fb status; do
+            [ -n "$compat" ] || continue
+            if [ "$status" = "disabled" ]; then
+              echo "ok   $compat  ($node is disabled - never probed, driver not needed)"
+              continue
+            fi
+            if [ -n "$fb" ] && [ "$fb" != "-" ]; then
+              # This branch used to print "ok ... falls back to X" and stop, so a fallback with
+              # no driver behind it looked exactly like a working one. The check was then
+              # rewritten to ask whether the fallback has a driver - and it was still wrong,
+              # because `has_driver syscon` can never succeed here: this kernel has no
+              # standalone "syscon" token. Its drivers/mfd/syscon.c has no of_device_id table
+              # and no platform driver at all; it registers on demand -
+              #     syscon_node_to_regmap(np) -> device_node_get_regmap(np,
+              #         of_device_is_compatible(np, "syscon"), true)
+              # - so zte,zx279133-idm-cci, -wdt-reset and -pon-route all get a regmap at lookup
+              # time, because every one of those nodes carries "syscon" as its fallback
+              # compatible. A node-to-driver table cannot see that, and neither can a string
+              # search. The substring test below is therefore about the *syscon core being
+              # compiled in*, which is the thing that actually decides.
+              case "$fb" in
+              syscon)
+                if grep -Fq -e 'regmap init failed' "$WORK/strings.txt" \
+                   && grep -Fxq -e '__regmap_init_mmio_clk' "$WORK/strings.txt"; then
+                  echo "ok   $compat  (falls back to 'syscon', and this tree's syscon core is"
+                  echo "ok     built and self-registers for any node compatible with syscon)"
+                else
+                  echo "note $compat  falls back to 'syscon', but drivers/mfd/syscon.c does not look"
+                  echo "note   built in this kernel - the lookup would fail at probe time"
+                  echo "note   Not fatal. The gate cannot tell whether the driver requires it."
+                fi
+                ;;
+              *)
+                if has_driver "$fb"; then
+                  echo "ok   $compat  (falls back to '$fb', which does have a driver)"
+                else
+                  # FATAL, and it was a note until 2026-10-15. Measured first: this board's
+                  # three non-syscon fallbacks - fixed-layout on calibration@44,
+                  # fixed-partitions on partition@0, arm,primecell on serial@10d0d000 - all
+                  # have drivers, so this rejects nothing today. It is a guard, not a fix.
+                  # What it removes is an asymmetry: a missing PRIMARY compatible was
+                  # already fatal, and a missing FALLBACK produces the same outcome - an
+                  # enabled node gets probed, matches nothing, binds to nothing, and the
+                  # board boots on without a word. "There is a fallback" is not a reason to
+                  # let a dead node through quietly.
+                  echo "::error::$compat falls back to '$fb', which has NO driver in this kernel"
+                  echo "::error::   $node is enabled, so it will be probed and bind to nothing."
+                  echo "::error::   Same outcome as a driver-less compatible, which is already"
+                  echo "::error::   fatal above. If this is a false positive from has_driver"
+                  echo "::error::   - it matches kernel strings whole-line, and the linker can"
+                  echo "::error::   tail-merge them - fix the matching, do not weaken this branch."
+                  rc=1
+                fi
+                ;;
+              esac
+              continue
+            fi
+            if has_driver "$compat"; then
+              echo "ok   $compat  (driver string present in the kernel)"
+            else
+              echo "::error::$compat is used by $node but no driver for it is in the kernel"
+              echo "::error::   the kernel skips such a node silently - the board would boot without it"
+              rc=1
+            fi
+          done <"$WORK/compat.txt"
+
+          # Named on its own because it is the one that decides whether this board has
+          # a usable network port at all, and because 02_network hardcodes eth0 to it.
+          if has_driver "zte,zx279133-nppt"; then
+            echo "ok   zte,zx279133-nppt present - the dtb's ethernet node has a driver"
+          else
+            echo "::error::zte,zx279133-nppt is not in the kernel - the board would boot with no network port"
+            rc=1
+          fi
+          echo "     gate verdict: $rc"
+          exit "$rc"
+
+      - name: Package initramfs image
+        id: package_initramfs
+        if: steps.pick.outputs.run == 'true' && matrix.mode == 'initramfs'
+        run: |
+          set -e
+          ITB=$(find openwrt/bin/targets/zte/zx279133 -maxdepth 1 -name '*sk-d840n*initramfs*' | head -1)
+          test -n "$ITB" || { echo "no initramfs image produced" >&2; ls -l openwrt/bin/targets/zte/zx279133; exit 1; }
+          echo "initramfs: $ITB"
+          cp "$ITB" sk-d840n-initramfs.itb
+          python3 tools/check-sk-lan1-led.py --fit sk-d840n-initramfs.itb
+          ls -l sk-d840n-initramfs.itb
+          echo "validated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Stage trial inputs
+        if: steps.pick.outputs.run == 'true'
+        run: |
+          set -u
+          mkdir -p trial
+          # No kexec in this build, on purpose: neither ImmortalWrt's nor upstream
+          # OpenWrt's package feed carries kexec-tools for aarch64 (0 hits in the
+          # 24.10 aarch64_generic base manifest, and `find feeds -iname 'kexec*'`
+          # after a full feeds install is empty). The loader instead comes from the
+          # PC side - tools/getkexec.sh assembles trial-kx.tgz from Alpine's musl
+          # aarch64 kexec-tools, which was verified to run on this board.
+          if [ "${{ matrix.mode }}" = initramfs ]; then
+            KT=$( { ls -d openwrt/build_dir/target-*/linux-zte_zx279133/linux-$KVER 2>/dev/null || true; } | head -1 )
+            test -n "$KT" || { echo "::error::no build dir for linux-$KVER (KVER=$KVER)" >&2; exit 1; }
+            echo "KT: $KT"
+            # OpenWrt builds the initramfs into Image, so this file *is* the RAM payload
+            test -f "$KT/arch/arm64/boot/Image" || { echo "no Image in $KT" >&2; exit 1; }
+            ls -l "$KT/arch/arm64/boot/Image"
+            # ~40 MB over tftp is slow, so it travels gzipped and is unpacked on the box
+            gzip -9nc "$KT/arch/arm64/boot/Image" > trial/trial-Image.gz
+            DTB=$(find "$KT/arch/arm64/boot/dts/zte" -name '*sk-d840n*.dtb' | head -1)
+            test -n "$DTB" || { echo "no sk-d840n dtb in the kernel tree" >&2; exit 1; }
+            cp "$DTB" trial/trial-dtb.bin
+            cp templates/trial-kexec.sh templates/flash-sk-d840n.sh trial/
+            ls -lR trial
+            ( cd trial && sha256sum trial-Image.gz trial-dtb.bin *.sh > sha256sums-trial )
+            tar czf trial-set.tgz -C trial trial-Image.gz trial-dtb.bin trial-kexec.sh flash-sk-d840n.sh sha256sums-trial
+            ls -l trial-set.tgz
+          fi
+
+      - name: Checksums and summary
+        if: steps.pick.outputs.run == 'true' && success()
+        run: |
+          test -s kernel-provenance.json
+          python3 -c 'import json, os; p=json.load(open("kernel-provenance.json")); assert p["version"] == os.environ["KVER"]; assert p["kernel_sha"] == os.environ["KERNEL_SHA"]'
+          # In initramfs mode the flash-* files do not exist; sha256sum then exits
+          # non-zero and pipefail would fail a job whose images are fine.
+          if [ "${{ matrix.mode }}" = flash ]; then
+            sha256sum immortalwrt-sk-d840n-sysupgrade.bin flash-uImage flash-dtb.bin \
+              flash-rootfs.jffs2 flash-sysupgrade.bin > sha256sums
+          else
+            sha256sum sk-d840n-initramfs.itb > sha256sums
+          fi
+          sha256sum kernel-provenance.json >> sha256sums
+          sha256sum -c sha256sums
+          {
+            echo "## ${{ matrix.mode }} output"
+            echo '```'
+            # Actions runs every step under `set -e`, and an unmatched glob makes
+            # ls exit 2 - which aborts the step even though all the images built.
+            ls -l flash-* sk-d840n-*.itb sha256sums trial-set.tgz 2>/dev/null || true
+            cat sha256sums 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.mode }}
+          include-hidden-files: true
+          path: |
+            openwrt/logs
+            openwrt/.config
+            sk-pon-tests.log
+            sk-management-gate.log
+            sk-panel-led-gate.log
+            /tmp/zx279133-sk-d840n.dts.dtb
+            /tmp/zx279133-sk-d840n.dts.dtc-native.log
+            /tmp/zx279133-sk-d840n.dts.dtc-cpp.log
+            /tmp/cpp.log
+            sk-configure.log
+            kernel-provenance.json
+            compile-parallel.log
+            compile-v1.log
+            compile-watchdog.log
+          if-no-files-found: ignore
+
+      - name: Upload outputs
+        # Failed or unvalidated firmware must not be offered for flashing.
+        if: >-
+          success() && steps.pick.outputs.run == 'true' &&
+          ((matrix.mode == 'flash' && steps.package_flash.outputs.validated == 'true') ||
+           (matrix.mode == 'initramfs' && steps.package_initramfs.outputs.validated == 'true'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk-d840n-${{ matrix.mode }}
+          path: |
+            flash-uImage
+            flash-dtb.bin
+            flash-rootfs.jffs2
+            flash-sysupgrade.bin
+            flash-set.tgz
+            sk-d840n-initramfs.itb
+            sha256sums
+            sha256sums-release
+            trial-set.tgz
+            trial
+            kernel-provenance.json
+
+      - name: Upload direct sysupgrade image
+        if: success() && steps.pick.outputs.run == 'true' && matrix.mode == 'flash' && steps.package_flash.outputs.validated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk-d840n-sysupgrade
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            immortalwrt-sk-d840n-sysupgrade.bin
+            immortalwrt-sk-d840n-sysupgrade.bin.sha256
+
+      - name: Publish release
+        if: >-
+          success() && steps.pick.outputs.run == 'true' &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish_release != false) &&
+          ((matrix.mode == 'flash' && steps.package_flash.outputs.validated == 'true') ||
+           (matrix.mode == 'initramfs' && steps.package_initramfs.outputs.validated == 'true'))
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: skd840n_${{ matrix.mode }}_${{ github.run_number }}_${{ github.run_id }}
+          # The version below is a literal, not $KVER, because GitHub does not expose the
+          # `env` context inside a step's `with:` values - `${{ env.KVER }}` written here
+          # would render as an empty string, and the release would be titled "mainline ".
+          # test_kernel_version_single_source.py asserts this literal equals KVER, so a
+          # version bump cannot leave the two apart. Everything that runs in a shell - every
+          # `test -f`, every `cp`, every build-dir lookup - does read $KVER.
+          #
+          # This note is a YAML comment ON PURPOSE, one line above the block. A `#` line
+          # INSIDE `body: |` is not a comment: it is Markdown that gets published with the
+          # release, and `${{ ... }}` inside it is still evaluated. Implementation notes about
+          # the note do not belong in the document a person reads to decide what to do.
+          body: |
+            ## SK-D840N（ZX279133，Linux 6.18.60）— ${{ matrix.mode }}
+
+            - ImmortalWrt 固定 `1b50aaf4`；ZX279133 驱动固定 `96e5a241`，叠加校验和锁定的官方 6.18.38 → 6.18.60 稳定补丁。
+              完整提交与逐补丁 SHA256 见 `kernel-provenance.json`；本次不跟随驱动分支新增功能。
+            - 板级文件：`zx279133-sk-d840n.dts`；分区顺序保证 `root` = mtdblock5，与板上现有 U-Boot 的 bootargs 一致
+            - **未在本机验证**。免串口流程：先 `trial-kexec.sh` 用 kexec 起 RAM 镜像（不写 flash，断电即回原系统），
+              确认 SSH 通了且 `/proc/mtd` 里 root 仍是第 5 个，再用 `flash-set.tgz` 里的 `flash-sk-d840n.sh --write`
+              按 root → dtb → kernel 的顺序写入
+            - **flash 模式直刷文件：`immortalwrt-sk-d840n-sysupgrade.bin`**。从本页 Assets 单独下载，
+              **上传至 LuCI 固件升级页面，无需解压**；也可用 `sysupgrade` 命令。内部是标准 sysupgrade tar，
+              已验证 kernel ≤ 8 MiB；`flash-sysupgrade.bin` 是字节完全相同的兼容文件名。
+              Actions artifact 下载仍会套 ZIP，关闭压缩也不改变这一机制；需要直接下载 `.bin` 请使用本页 Assets。
+              `flash-set.tgz` 是维护/救援包，不可直接上传至 LuCI；`.itb` 是 initramfs 模式的 RAM 救援镜像。
+              注意：换了 kernel 的 sysupgrade 若内核起不来，没有串口就只能上编程器 —— 先用 kexec 试驾
+            - LAN 口走 SR1010 的 NPPT 路径，PHY 是 **RTL8226B**（Realtek），在 MDIO controller #1 的地址 5 上。
+              **板级 dts 里现在没有这颗 PHY 的节点**（2026-10-29 删掉），这是实测的结果，不是偏好：
+              节点在的时候 of_mdiobus 会造出 `14f02000.mdio:05` 这个 phy_device，phylib 按芯片自己报的
+              ID（0x001cc849）匹配到 `CONFIG_REALTEK_PHY`，把**树里的通用 realtek 驱动**绑上去，
+              而那个驱动的 `config_init()` 会改写 RTL8226 的 SerDes 选项（devad 0x1e 的
+              0x697a / 0x6a04 / 0x6f10 / 0x6f11；厂商的值是 0x0003 / 0x0503 / 0x084a / 0x0021）。
+              后果是 devad 7 reg 1 里「block lock / RX valid」那一位掉了：同一块板、同一次上电，
+              厂商 U-Boot 读 0x00e9、mainline 读 0x00ad。**已证的是 phylib 确实动了这颗芯片；
+              它是不是闸门，由下一轮的 N3 判**（docs/92 §94.6–§94.7）。
+              这颗 PHY 现在**既不 attach 也不配置**：`ethernet@19000000` 里是
+              `fixed-link { speed = <1000>; full-duplex; }`、没有 `phy-handle`，
+              端口的链路由驱动自己用 `mdiobus_c45_read(bus, 5, 7, 1)` 从芯片里读；
+              铜线侧的自协商由 PHY 自己做（同一颗芯片、同一根线，U-Boot 用它拉过 11 MB）。
+              调试台 `m45`/`m45w` 同样改走 `mdiobus_c45_read/write`（真 Clause-45），
+              因为 phylib 的 C22 间接访问读这颗芯片的私有块 devad 0x1e 只会回 0xdead。
+              内核里编进的是 **`CONFIG_REALTEK_PHY=y`**（CI 的 PHY 门查的就是这个），
+              **不是** `CONFIG_ZX279051_PHY`：已构建内核里没有任何独立的 `zx279051` token，
+              只有 `tzx279051` 这种内核字符串表 tail-merge 的残渣。
+              `02_network` 把 lan 绑在 eth0 上，地址固定 192.168.9.1。
+              **关于 PON，修正一句旧说法**：内核不是上游 torvalds/linux，而是
+              `CONFIG_EXTERNAL_KERNEL_TREE` 指向的 prepared ZX279133 树
+              （`target/linux/zte/Makefile` 里不设它就直接报错）。
+              那棵树里的 **`ZTE_ZX279133_ETH` 就是 PON MAC**——它的 Kconfig 硬依赖
+              `PHY_ZX279133_PON_SERDES`，dtb 节点 `zte,zx279133-nppt` 挂在 pon_serdes/uni_serdes 上、
+              `phy-mode = "2500base-x"`、带 PON MAC 时钟；它在 probe 时
+              `request_firmware("zte/zx279133/mcode_intel.bin")` 加载中兴自己的 PPU 微码
+              （树里那份 103456 B，CRC32 `0xef1d7647`，正好是驱动自己判定标定的那两个值）。
+              `zte,pon-route` / `zte,idm-cci` 是**必需**属性，但能解析：这棵树的
+              `drivers/mfd/syscon.c` 没有匹配表、查找时按需注册，凡 compatible 带 `"syscon"` 的节点都能拿到 regmap。
+              **仍未证实**：G.984.1 的 PLOAM/GEM/T-CONT/OMCI **状态机不在这棵树里**——
+              已构建内核中 `PLOAM`/`Op State Machine`/`p_o7_enable_sn_msg`/`Serena` 全部零命中。
+              厂商侧：18 个厂商模块逐个数过，这四个精确 token 里只有 `p_o7_enable_sn_msg`
+              在 `zte_xgpon.ko` 里（另有 `power_p5_fwi`、`ASSIGN_ALLOC_ID_MESSAGE`）；
+              `PLOAM`、`Op State Machine`、`Serena` 在任何一个厂商模块里都不是独立字符串。
+              该模块确实带着整套 PLOAM 机制，只是以更长字符串的形式存在——
+              `STACK PLOAM DATA`、`%s %d Ploam Msg Is NULL!`、`DGTCT Rcv Ploam Cnt`。
+              也就是说这棵树实现的是 **PON 数据通路**，不是 PON。
+              微码里的 packet-type / port-flow 表是否自带 GEM 分流，从头部读不出来；这需要一次起内核看日志。
+              运行时网口会不会出现，同样只能在板子上看 `/sys/class/net`。
+          files: |
+            immortalwrt-sk-d840n-sysupgrade.bin
+            immortalwrt-sk-d840n-sysupgrade.bin.sha256
+            flash-uImage
+            flash-dtb.bin
+            flash-rootfs.jffs2
+            flash-sysupgrade.bin
+            flash-sk-d840n.sh
+            sk-d840n-initramfs.itb
+            sha256sums
+            sha256sums-release
+            flash-set.tgz
+            trial-set.tgz
+            trial/*
+            kernel-provenance.json
+          ignore_missing_files: true
+
+      - name: Direct firmware download summary
+        if: success() && steps.pick.outputs.run == 'true' && matrix.mode == 'flash' && steps.package_flash.outputs.validated == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish_release != false)
+        run: |
+          {
+            echo '## ImmortalWrt 直刷固件'
+            echo '[下载 immortalwrt-sk-d840n-sysupgrade.bin](https://github.com/${{ github.repository }}/releases/download/skd840n_flash_${{ github.run_number }}_${{ github.run_id }}/immortalwrt-sk-d840n-sysupgrade.bin)'
+            echo
+            echo '上传至 LuCI 固件升级页面，无需解压。Actions artifact 外层仍是 ZIP；上面的 Release 链接直接下载 .bin。'
+            echo 'flash-set.tgz 用于维护/救援，不能直接上传至 LuCI；initramfs .itb 只用于 RAM 启动。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bootweb:
+    name: native241 bootweb (offline candidate)
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'all' || inputs.mode == 'bootweb'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned host dependencies
+        run: |
+          python -m pip install --disable-pip-version-check capstone==5.0.7 PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'Host dependency installation failed' }
+      - name: Check bootweb workflow contract
+        run: |
+          python -X utf8 tests/test_bootweb_ci_workflow.py
+          if ($LASTEXITCODE -ne 0) { throw 'Bootweb workflow contract failed' }
+      - name: Cache locked public dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            bootweb/.build/toolchain
+            bootweb/.build/ci-deps
+          key: bootweb-windows2022-${{ hashFiles('bootweb/tools/dependencies.lock.json') }}
+      - name: Prepare and verify public dependencies
+        run: |
+          python -X utf8 bootweb/tools/ci.py prepare
+          if ($LASTEXITCODE -ne 0) { throw 'Public dependency preparation failed' }
+      - name: Build and validate native241 candidate
+        id: package_bootweb
+        run: |
+          python -X utf8 bootweb/tools/ci.py build
+          if ($LASTEXITCODE -ne 0) { throw 'Native241 offline build failed' }
+          python -X utf8 bootweb/tools/ci.py validate-dist
+          if ($LASTEXITCODE -ne 0) { throw 'Native241 publication gate failed' }
+          $writer = [System.IO.StreamWriter]::new($env:GITHUB_OUTPUT, $true, [System.Text.UTF8Encoding]::new($false))
+          try { $writer.WriteLine('validated=true') } finally { $writer.Dispose() }
+      - name: Upload bootweb failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk-d840n-bootweb-failure-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: bootweb/.build/ci-native241/reports/
+      - name: Upload validated bootweb outputs
+        if: success() && steps.package_bootweb.outputs.validated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk-d840n-bootweb-native241
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            bootweb/.build/ci-native241/dist/sk-d840n-bootweb-native241-candidate.tar
+            bootweb/.build/ci-native241/dist/sk-d840n-bootweb-native241-tools.tgz
+            bootweb/.build/ci-native241/dist/sha256sums-bootweb
+      - name: Publish bootweb candidate release
+        if: success() && steps.package_bootweb.outputs.validated == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish_release != false)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: skd840n_bootweb_${{ github.run_number }}_${{ github.run_id }}
+          name: SK-D840N native241 bootweb candidate ${{ github.run_number }}
+          prerelease: true
+          fail_on_unmatched_files: true
+          body: |
+            ## SK-D840N native241 常驻 Web 恢复候选包
+
+            仅绑定公开 `svn308776` 原始 U-Boot 基底，stage2 SHA256：
+            `5b084490813b540c1a82ddf2e2d4de46080e6cfe47b15b2e6575bdf3fe198fe9`。
+            已安装其他常驻版本的设备不能直接套用。本包不能上传到 LuCI 或当前锁定的 Web U-Boot 自刷入口。
+
+            - `sk-d840n-bootweb-native241-candidate.tar`：严格三成员候选包，仅含 stage2；不是完整 boot 分区镜像。
+            - `sk-d840n-bootweb-native241-tools.tgz`：调试 ELF/BIN、源码、构建清单、指令审计、离线报告、许可证及说明。
+            - `sha256sums-bootweb`：两个下载包的 SHA256。
+
+            CI 通过只表示离线构建与校验通过，不代表本次候选包已完成实机验收或取得安装授权。
+            native241 系统恢复要求持续供电；安装仍需新的完整 ECC 备份、精确镜像核对及对应安装流程。
+            网页 U-Boot 自刷仍锁定，周期断电刷写预算、BTL 救援和 2.5G 性能均未由 CI 验证。
+          files: |
+            bootweb/.build/ci-native241/dist/sk-d840n-bootweb-native241-candidate.tar
+            bootweb/.build/ci-native241/dist/sk-d840n-bootweb-native241-tools.tgz
+            bootweb/.build/ci-native241/dist/sha256sums-bootweb
+      - name: Bootweb download summary
+        if: success() && steps.package_bootweb.outputs.validated == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish_release != false)
+        env:
+          RELEASE_BASE: https://github.com/${{ github.repository }}/releases/download/skd840n_bootweb_${{ github.run_number }}_${{ github.run_id }}
+        run: |
+          $writer = [System.IO.StreamWriter]::new($env:GITHUB_STEP_SUMMARY, $true, [System.Text.UTF8Encoding]::new($false))
+          try {
+            $writer.WriteLine('## native241 Bootweb 离线候选包')
+            $writer.WriteLine("[下载候选包]($env:RELEASE_BASE/sk-d840n-bootweb-native241-candidate.tar)")
+            $writer.WriteLine("[下载配套工具]($env:RELEASE_BASE/sk-d840n-bootweb-native241-tools.tgz)")
+            $writer.WriteLine("[SHA256]($env:RELEASE_BASE/sha256sums-bootweb)")
+            $writer.WriteLine('仅适用于公开 svn308776 原始基底。离线通过不等于实机验收；网页 U-Boot 自刷仍锁定。')
+          } finally { $writer.Dispose() }

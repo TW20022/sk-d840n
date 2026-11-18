@@ -1,0 +1,72 @@
+diff --git a/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c b/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
+index 06a3ae2..9aa4c1f 100644
+--- a/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
++++ b/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
+@@ -2017,6 +2017,49 @@ static int zx279133_switch_uni_link(struct zx279133_switch *priv, int port)
+ 	return !!(bmsr & BMSR_LSTATUS);
+ }
+ 
++/*
++ * The real speed/duplex of one UNI jack, from its internal PHY's BMCR.
++ *
++ * These PHYs (id 0x84b9:0x5032) do not expose the negotiated 1000BASE-T
++ * result in MII_STAT1000 - reg 15 reads 0x3000 on both a 100M and a 1000M
++ * link.  They do keep the resolved speed in the standard BMCR speed-select
++ * bits, and update duplex in BMCR_FULLDPLX while autonegotiation is on:
++ *
++ *   BMCR_SPEED1000 (bit 6)  -> 1000M   (measured BMCR 0x1140)
++ *   BMCR_SPEED100  (bit 13) -> 100M    (measured BMCR 0x3100)
++ *   neither                 -> 10M
++ *
++ * Reading these lets a 100M-only peer be reported as 100M instead of the
++ * hardcoded 1000M, which previously left phylink/MAC and the copper side
++ * disagreeing and the port passing no frames.
++ */
++static void zx279133_switch_uni_speed_duplex(struct zx279133_switch *priv,
++					     int port, int *speed, int *duplex)
++{
++	int addr, bmcr;
++
++	/* Keep the old behaviour when the register cannot be read. */
++	*speed = SPEED_1000;
++	*duplex = DUPLEX_FULL;
++
++	if (!priv->uni_mdio)
++		return;
++
++	addr = ZX279133_SWITCH_DSA_PHY(port);
++	bmcr = mdiobus_read(priv->uni_mdio, addr, MII_BMCR);
++	if (bmcr < 0)
++		return;
++
++	if (bmcr & BMCR_SPEED1000)
++		*speed = SPEED_1000;
++	else if (bmcr & BMCR_SPEED100)
++		*speed = SPEED_100;
++	else
++		*speed = SPEED_10;
++
++	*duplex = (bmcr & BMCR_FULLDPLX) ? DUPLEX_FULL : DUPLEX_HALF;
++}
++
+ static void zx279133_switch_outerphy_dump(struct zx279133_switch *priv);
+ 
+ /*
+@@ -3067,10 +3110,15 @@ static void zx279133_switch_phylink_fixed_state(struct dsa_switch *ds, int port,
+ 		return;
+ 	}
+ 
++	{
++		int speed, duplex;
++
++		zx279133_switch_uni_speed_duplex(priv, port, &speed, &duplex);
++		state->speed = speed;
++		state->duplex = duplex;
++	}
+ 	link = zx279133_switch_uni_link(priv, port);
+ 	state->link = link == 1;
+-	state->speed = SPEED_1000;
+-	state->duplex = DUPLEX_FULL;
+ }
+ 
+ static void zx279133_switch_phylink_get_caps(struct dsa_switch *ds, int port,

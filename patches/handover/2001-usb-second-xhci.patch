@@ -1,0 +1,47 @@
+--- a/kernel-overlays/arch/arm64/boot/dts/zte/zx279133-sk-d840n.dts
++++ b/kernel-overlays/arch/arm64/boot/dts/zte/zx279133-sk-d840n.dts
+@@ -326,6 +326,44 @@
+ 		reg = <0x00 0x15900000 0x00 0x100000>;
+ 		status = "okay";
+ 	};
++
++	/*
++	 * SK-D840N exposes TWO physical USB ports on TWO independent xHCI
++	 * controllers.  The vendor DTB enables both:
++	 *   15008000 -> GIC_SPI 63  (one physical port)
++	 *   15010000 -> GIC_SPI 65  (the other physical port)
++	 * The mainline dtsi declares only usb3@15010000 (label usb3, enabled
++	 * below with &usb3).  The 15008000 controller has no node at all in
++	 * the community device tree, so that physical port has no driver:
++	 * a device plugged into it produces no bus, no insert event, nothing
++	 * in dmesg.  Live on 2026-11-17: /sys/bus/platform/devices/ listed
++	 * only 15010000.usb3; 15008000 did not exist.
++	 *
++	 * Add the missing controller here.  This node deliberately mirrors
++	 * the working usb3@15010000 node in zx279133.dtsi byte for byte
++	 * except for reg and the interrupt line, so it binds the same
++	 * "zte,zx279133-xhci" driver that already works on this SoC.  Do NOT
++	 * use the vendor "generic-xhci" string here: the mainline board file
++	 * has no xhci generic compatible wired to a clock provider.
++	 *
++	 * reg/interrupt values are read from the vendor DTB in the stock
++	 * 256 MiB flash (partition dtb @0x697b80):
++	 *   usb3@15008000 reg = <0 0x15008000 0 0x4000>
++	 *                 interrupts = <0 0x3f 4>  -> GIC_SPI 63, LEVEL_HIGH
++	 * Clocks are identical to the 15010000 node: USB_ACLK/PCLK/CCI_ACLK
++	 * (topcrm indices 9/7/8, confirmed in dt-bindings/clock/zte,zx279133-topcrm.h).
++	 */
++	usb2: usb@15008000 {
++		compatible = "zte,zx279133-xhci";
++		reg = <0x0 0x15008000 0x0 0x4000>;
++		interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&topcrm ZX279133_TOPCRM_CLK_USB_ACLK>,
++			 <&topcrm ZX279133_TOPCRM_CLK_USB_PCLK>,
++			 <&topcrm ZX279133_TOPCRM_CLK_USB_CCI_ACLK>;
++		clock-names = "core", "reg", "cci";
++		dma-coherent;
++		status = "okay";
++	};
+ };
+ 
+ &uart0 {

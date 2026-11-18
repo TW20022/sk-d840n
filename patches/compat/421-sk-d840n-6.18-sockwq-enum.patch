@@ -1,0 +1,16 @@
+--- a/backport-include/linux/net.h
++++ b/backport-include/linux/net.h
+@@ -4,11 +4,7 @@
+ #include <linux/static_key.h>
+ 
+ 
+-#ifndef SOCKWQ_ASYNC_NOSPACE
+-#define SOCKWQ_ASYNC_NOSPACE   SOCK_ASYNC_NOSPACE
+-#endif
+-#ifndef SOCKWQ_ASYNC_WAITDATA
+-#define SOCKWQ_ASYNC_WAITDATA   SOCK_ASYNC_WAITDATA
+-#endif
++/* SK-D840N custom 6.18.60: SOCKWQ_ASYNC_* are enum constants in this kernel,
++ * not macros; backports must not redefine them to removed SOCK_ASYNC_* names. */
+ 
+ #endif /* __BACKPORT_LINUX_NET_H */

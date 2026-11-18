@@ -1,0 +1,79 @@
+--- a/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
++++ b/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
+@@ -297,6 +297,21 @@
+ #define ZX279133_XPCS_UBOOT_SR_MII_SPEED	0x0020
+ #define ZX279133_XPCS_UBOOT_DIG_CTRL1		0x2200
+ #define ZX279133_XPCS_UBOOT_AN_CTRL		0x0005
++/*
++ * The same four words on the 2.5G branch.
++ *
++ * The loader configures this lane for 2500BASE-X when the peer behind the
++ * jack negotiated 2.5G, and leaves these values (docs/92 §96.15; written and
++ * read back through this console on 2026-10-29: 0x2140 / 0x0020 / 0x2000 /
++ * 0x0000).  They differ from the 1G profile in every one of the four: the
++ * BMCR's bit 13 (the speed select) is set, the DIG_CTRL1 drops the MAC
++ * auto-switch bit, and the AN_CTRL's PCS mode field is 0 - 1000BASE-X -
++ * rather than the SGMII profile's 2.
++ */
++#define ZX279133_XPCS_2G5_BMCR		0x2140
++#define ZX279133_XPCS_2G5_SR_MII_SPEED	0x0020
++#define ZX279133_XPCS_2G5_DIG_CTRL1	0x2000
++#define ZX279133_XPCS_2G5_AN_CTRL	0x0000
+ #define ZX279133_XPCS_DUPLEX		BIT(8)
+ #define ZX279133_XPCS_PSEQ_MASK		GENMASK(4, 2)
+ #define ZX279133_XPCS_PSEQ_IDLE		0x4
+@@ -3871,6 +3886,54 @@
+ 					   ZX279133_XPCS_LOW_POWER, 0);
+ 	if (ret)
+ 		return ret;
++
++	/*
++	 * The lane's own four words, in the 2.5G profile.
++	 *
++	 * The three words zx279133_switch_xpcs_program_lane() writes are the
++	 * SGMII profile's, and in 2500BASE-X this block does not use them.
++	 * The loader's own 2.5G branch leaves 0x2140 / 0x0020 / 0x2000 /
++	 * 0x0000 there (docs/92 §96.15, and the 2026-10-29 measurement that
++	 * wrote exactly those four through this console and read them back).
++	 * Whatever the boot left behind is the residue of another profile.
++	 *
++	 * Keeping that residue costs the lane every frame it receives, even
++	 * with everything else correct.  Measured on the board on 2026-11-17
++	 * with a 2.5G peer on the jack: the copper side negotiated
++	 * 2500/Full, the Uni SerDes was running its 2.5G image (mode 0x409,
++	 * CDR locked), XMAC0 was at speed 6 and the far end's mode word read
++	 * 0x9416 - 2500BASE-X - and lan1 received nothing at all: rx 0
++	 * packets for the whole session, while VEND2 still held 0x1140 /
++	 * 0x0020 / 0x2200 / 0x0005, the 1G SGMII profile the loader leaves
++	 * when the peer it saw was a 1G or 100M one.  Writing these four
++	 * words moved the receive counter at once, and the link then carried
++	 * real traffic: ARP resolved and 5 of 5 pings came back in 0.63 ms
++	 * average.  The far end's mode word stayed 0x9416 throughout, so the
++	 * copper side never re-negotiated - what changed was only what this
++	 * PCS transmits.
++	 *
++	 * The AN_CTRL is written as 0x0000: in 2500BASE-X the PCS mode field
++	 * (bits 2:1) is 0, not the SGMII profile's 2.
++	 */
++	ret = zx279133_switch_xpcs_write(priv, MDIO_MMD_VEND2, MII_BMCR,
++					  ZX279133_XPCS_2G5_BMCR);
++	if (ret)
++		return ret;
++	ret = zx279133_switch_xpcs_write(priv, MDIO_MMD_VEND2,
++					 ZX279133_XPCS_VEND2_SR_MII_SPEED,
++					 ZX279133_XPCS_2G5_SR_MII_SPEED);
++	if (ret)
++		return ret;
++	ret = zx279133_switch_xpcs_write(priv, MDIO_MMD_VEND2,
++					 ZX279133_XPCS_VR_MII_DIG_CTRL1,
++					 ZX279133_XPCS_2G5_DIG_CTRL1);
++	if (ret)
++		return ret;
++	ret = zx279133_switch_xpcs_write(priv, MDIO_MMD_VEND2,
++					 ZX279133_XPCS_VR_MII_AN_CTRL,
++					 ZX279133_XPCS_2G5_AN_CTRL);
++	if (ret)
++		return ret;
+ 	priv->xpcs_configured = false;
+ 	return 0;
+ }

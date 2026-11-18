@@ -1,0 +1,106 @@
+#!/bin/sh
+# Trial-only (staged into the RAM image by CI, or via --initrd from
+# tools/mktrialram.py). Nothing here belongs in a released image.
+#
+# Three things must not depend on the image's own first-boot configuration, because a
+# wrong guess in any of them looks exactly like a kernel that does not boot:
+#
+#   * the panel LEDs - tried first, because it is the only signal that needs neither a
+#     working port nor a working reset (see usr/libexec/trial-blink);
+#   * which netdev the usable RJ45 is. /etc/board.d/02_network puts the address on
+#     eth0, but the mainline NPPT driver may name this board's port something else, so
+#     every netdev that appears gets the address, and ssh is started unbound as well;
+#   * whether a reboot is even observable. SoC reset does not reset the RTL8226, so the
+#     link stays Up through it - hence the deliberate flap before the canary.
+
+(
+	# Forever, not once: with no serial port the panel is the console, and a single ~70 s
+	# walk is easy to miss - one round on this board was observed by nobody and its
+	# evidence was gone before it could be asked about. Cycling costs nothing (the canary
+	# reboot ends it anyway, and /tmp/trial-noreboot keeps the image alive so the walk
+	# keeps running while a shell is open), and every pass writes its own markers to kmsg,
+	# so the sequence can also be reconstructed from dmesg after the fact.
+	( while :; do /usr/libexec/trial-blink 3 2>/dev/null; sleep 20; done ) &
+
+	# Same address the flashed system's lan now uses, so one IP covers before and after
+	# the jump - and 192.168.9.0/24 exists only on the test PC's wired adapter, unlike the
+	# 192.168.1.1 this board used to answer as, which its own WiFi router also owns. An
+	# answer there proved nothing; an answer here can only have come through this jack.
+	addr=192.168.9.1/24
+	i=0
+	while [ $i -lt 8 ]; do
+		i=$((i + 1))
+		if [ -e /sys/class/net/br-lan ]; then
+			# The image's own network init has taken over, and it owns
+			# the address now.  The bridge's own ports must not get
+			# one either: an address on a bridge port is a second
+			# answer to the same ARP, and on a DSA port it is an
+			# address the bridge cannot take over.
+			ip addr replace $addr dev br-lan 2>/dev/null
+		else
+			for d in /sys/class/net/*; do
+				[ -d "$d" ] || continue
+				n=${d#/sys/class/net/}
+				case "$n" in
+				lo|lan1|lan2|lan3|lan4)
+					# The DSA user ports belong to the bridge.
+					continue
+					;;
+				esac
+				ip link set "$n" up 2>/dev/null
+				ip addr replace $addr dev "$n" 2>/dev/null
+			done
+		fi
+		pidof dropbear >/dev/null 2>&1 || /usr/sbin/dropbear -s -B -p 22
+		sleep 15
+	done
+
+	n=""
+	for d in /sys/class/net/*; do
+		[ -d "$d" ] || continue
+		n="$n ${d#/sys/class/net/}"
+	done
+	echo "trial: netdevs=$n addr=$addr" >/dev/kmsg
+
+	# The evidence this round is for, in one place: the 9132's port words
+	# and enable word, its four internal PHYs (id, BMCR, link before and
+	# after the settle), the Uni SerDes profile the bootloader left, and
+	# the XPCS0 status word.  The kernel prints all of it into the same
+	# console the serial relay keeps, but only if somebody asks - and
+	# "ask" here means one grep into kmsg, which survives in dmesg even if
+	# the image is pulled out of the board's memory.
+	{
+		echo "trial: evidence"
+		dmesg | grep -E '9132|Uni SerDes|XMAC0|XPCS0|lan-cpu|conduit|Link is|DSA|dsa|tag_zx279133|phylink|MDIO|mdio|lane |SOPC'
+		echo "trial: evidence end"
+	} >/dev/kmsg 2>&1
+
+	(
+		sleep 300
+		# touch /tmp/trial-noreboot from ssh to keep the image running
+		[ -e /tmp/trial-noreboot ] && exit 0
+		echo "trial: beacon before reboot" >/dev/kmsg
+		/usr/libexec/trial-blink 2 2>/dev/null
+		# netifd has to be stopped first, or it re-raises any interface it manages
+		# inside the watcher's ~7 s sampling gap and the flap is invisible.
+		/etc/init.d/network stop 2>/dev/null
+		i=0
+		while [ $i -lt 3 ]; do
+			i=$((i + 1))
+			for d in /sys/class/net/*; do
+				[ -d "$d" ] || continue
+				ip link set "${d#/sys/class/net/}" down 2>/dev/null
+			done
+			sleep 12
+			for d in /sys/class/net/*; do
+				[ -d "$d" ] || continue
+				ip link set "${d#/sys/class/net/}" up 2>/dev/null
+			done
+			sleep 12
+		done
+		echo "trial: canary reboot" >/dev/kmsg
+		/sbin/reboot -f
+	) &
+) &
+
+exit 0

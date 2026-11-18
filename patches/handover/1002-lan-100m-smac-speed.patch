@@ -1,0 +1,195 @@
+From: skd840n-local <local@example.com>
+Subject: [PATCH] zx279133-switch: tell the SMAC the rate the PHY settled on
+
+The four user ports' internal PHYs (id 0x84b9:0x5032) negotiate 10/100/1000
+autonomously, but nothing ever told the switch's per-port MAC (SMAC) what the
+result was.  zx279133_switch_smac_init() writes the vendor's steady word
+0x00fa2203 into every SMAC's an_ctrl, and bits 15:13 of that word are a rate
+code -- 0b001, i.e. 1000M/full.  The vendor's own module has the missing
+step: nppt_smac_config_speed_duplex() (np_133.ko .text 0xd330) rewrites those
+three bits from the PHY's answer:
+
+	bits 15:14  rate    00 = 1000M   10 = 100M   11 = 10M
+	bit  13     duplex  1 = full
+
+	1G/full 0x2000   100M/full 0xa000   10M/full 0xe000
+	(half duplex only clears bit 13)
+
+With the word left at 1000M/full, a 100M link receives nothing at all: the
+MAC samples the PHY's MII bus at the wrong rate, so the frames the PHY hands
+over never become a receive event.  The RED in-forward counter climbs with
+the board's own traffic, the SMAC's port counter stays at 0, no netdev RX
+moves and no interrupt fires.  A 1000M peer works because the stale word
+happens to be right.
+
+Measured on SK-D840N, 2026-11-17, same jack, same PHY, same cable, one
+register written between runs (port 6 is the jack at panel LAN3, SMAC 2):
+
+  an_ctrl 0x00faa203 (100M/full)  ->  ping 6/6, lan3 rx +7 frames / 8 s
+  an_ctrl 0x00fa2203 (1000M/full) ->  ping 6/0, lan3 rx +0 frames / 8 s
+  an_ctrl 0x00faa203 again        ->  ping 6/6, lan3 rx +8 frames / 8 s
+
+The same probe over the port pair LAN3<->LAN4 had already shown the split is
+only about rate: 1000M passed 5 of 5 frames, 100M passed 0 of 6, with the
+SMAC configured identically both times.
+
+So: read BMCR for the real speed/duplex (the PHYs keep it there; MII_STAT1000
+reads 0x3000 either way, which is why the driver hardcoded 1000M), report it
+to phylink so ethtool/LuCI are right, and write the matching rate code into
+the SMAC so the MAC actually samples at that rate.  The write is skipped when
+the word already matches, so the per-second fixed-state poll is free.
+
+Only the three rate bits are touched; the rest of an_ctrl, the packet filter,
+the speed word at +0xe0 and the port control bit are left as the vendor's
+initialisation left them, because they did not need to change -- a 1G jack
+keeps the byte-identical word it had before this patch.
+
+--- a/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
++++ b/kernel-overlays/drivers/net/ethernet/zte/zx279133-switch.c
+@@ -2015,6 +2015,126 @@
+ 		return -1;
+ 
+ 	return !!(bmsr & BMSR_LSTATUS);
++}
++
++/*
++ * The real speed/duplex of one UNI jack, from its internal PHY's BMCR.
++ *
++ * These PHYs (id 0x84b9:0x5032) do not expose the negotiated 1000BASE-T
++ * result in MII_STAT1000 - reg 15 reads 0x3000 on both a 100M and a 1000M
++ * link.  They do keep the resolved speed in the standard BMCR speed-select
++ * bits, and update duplex in BMCR_FULLDPLX while autonegotiation is on:
++ *
++ *   BMCR_SPEED1000 (bit 6)  -> 1000M   (measured BMCR 0x1140)
++ *   BMCR_SPEED100  (bit 13) -> 100M    (measured BMCR 0x3100)
++ *   neither                 -> 10M
++ */
++static void zx279133_switch_uni_speed_duplex(struct zx279133_switch *priv,
++					     int port, int *speed, int *duplex)
++{
++	int addr, bmcr;
++
++	/* Keep the old behaviour when the register cannot be read. */
++	*speed = SPEED_1000;
++	*duplex = DUPLEX_FULL;
++
++	if (!priv->uni_mdio)
++		return;
++
++	addr = ZX279133_SWITCH_DSA_PHY(port);
++	bmcr = mdiobus_read(priv->uni_mdio, addr, MII_BMCR);
++	if (bmcr < 0)
++		return;
++
++	if (bmcr & BMCR_SPEED1000)
++		*speed = SPEED_1000;
++	else if (bmcr & BMCR_SPEED100)
++		*speed = SPEED_100;
++	else
++		*speed = SPEED_10;
++
++	*duplex = (bmcr & BMCR_FULLDPLX) ? DUPLEX_FULL : DUPLEX_HALF;
++}
++
++/*
++ * The rate bits of a SMAC's own control word, the way the vendor's
++ * nppt_smac_config_speed_duplex() (np_133.ko 0xd330) spells them:
++ *
++ *	bits 15:14	rate	00 = 1000M, 10 = 100M, 11 = 10M
++ *	bit 13		duplex	1 = full
++ *
++ * so 1G/full is 0x2000, 100M/full is 0xa000, 10M/full is 0xe000, each rate
++ * with a half-duplex form that only clears bit 13.  The vendor's own board
++ * leaves all four MACs at 0x00fa2203, whose bits 15:13 are 0b001 - 1G, full -
++ * which is right only for a 1000M peer.
++ */
++#define ZX279133_SMAC_RATE_MASK		0x0000e000
++
++static u32 zx279133_switch_smac_rate_bits(int speed, int duplex)
++{
++	u32 bits;
++
++	if (speed == SPEED_1000)
++		bits = 0x0000;
++	else if (speed == SPEED_100)
++		bits = 0x8000;
++	else
++		bits = 0xc000;
++
++	if (duplex == DUPLEX_FULL)
++		bits |= 0x2000;
++
++	return bits;
++}
++
++/*
++ * Tell one SMAC what rate its PHY settled on.
++ *
++ * The SMAC sits between the jack's PHY and the switch fabric, and it samples
++ * the PHY's MII bus at the rate in this word.  While the word said 1G and the
++ * PHY had negotiated 100M, the MAC sampled the wrong edges: the frames the
++ * PHY handed over never became a receive event, the RED counters stayed
++ * still and the port looked dead.  A 1000M peer worked because the word and
++ * the PHY agreed.
++ *
++ * The vendor does more than this when - and only when - the duplex changes
++ * (a reset pulse, the packet filter, the speed word at +0xe0, three control
++ * bits).  A rate change on its own needs just this word.
++ */
++static void zx279133_switch_smac_set_rate(struct zx279133_switch *priv,
++					  int port, int speed, int duplex)
++{
++	u32 mac = port - ZX279133_SWITCH_DSA_PORT_MIN;
++	u32 base, an_ctrl, want, hd;
++
++	if (mac >= ZX279133_SMAC_COUNT)
++		return;
++
++	base = ZX279133_SMAC_BASE(mac);
++	want = zx279133_switch_smac_rate_bits(speed, duplex);
++
++	an_ctrl = zx279133_switch_nppt_read(priv, base + ZX279133_SMAC_AN_CTRL);
++	if ((an_ctrl & ZX279133_SMAC_RATE_MASK) == want)
++		return;
++
++	zx279133_switch_nppt_write(priv, base + ZX279133_SMAC_AN_CTRL,
++				   (an_ctrl & ~ZX279133_SMAC_RATE_MASK) | want);
++
++	/* nppt+0x343f0, bit(mac): this MAC runs half duplex. */
++	hd = zx279133_switch_nppt_read(priv, ZX279133_SMAC_SOPC_PULSE);
++	if (duplex == DUPLEX_FULL)
++		hd &= ~(1u << mac);
++	else
++		hd |= (1u << mac);
++	zx279133_switch_nppt_write(priv, ZX279133_SMAC_SOPC_PULSE, hd);
++
++	dev_info(priv->dev,
++		 "SMAC %u: rate word 0x%08x -> 0x%08x (%s %s)\n",
++		 mac, an_ctrl,
++		 (an_ctrl & ~ZX279133_SMAC_RATE_MASK) | want,
++		 speed == SPEED_1000 ? "1000M" :
++		 speed == SPEED_100 ? "100M" : "10M",
++		 duplex == DUPLEX_FULL ? "full" : "half");
+ }
+ 
+ static void zx279133_switch_outerphy_dump(struct zx279133_switch *priv);
+@@ -3069,8 +3189,17 @@
+ 
+ 	link = zx279133_switch_uni_link(priv, port);
+ 	state->link = link == 1;
+-	state->speed = SPEED_1000;
+-	state->duplex = DUPLEX_FULL;
++
++	zx279133_switch_uni_speed_duplex(priv, port, &state->speed,
++					 &state->duplex);
++
++	/*
++	 * And hand the same answer to the SMAC, which is the part that was
++	 * missing: phylink knowing the rate does not make the MAC run at it.
++	 */
++	if (state->link)
++		zx279133_switch_smac_set_rate(priv, port, state->speed,
++					      state->duplex);
+ }
+ 
+ static void zx279133_switch_phylink_get_caps(struct dsa_switch *ds, int port,

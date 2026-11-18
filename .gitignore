@@ -1,0 +1,76 @@
+# Working artifacts, never source.
+#
+# staging/ is where the PC-side tools/ scripts expect to find everything they operate on:
+# downloaded release artifacts, extracted kernel images, DTB dumps of the stock firmware, and
+# the md5-verified rollback set. It is 431 MiB on this machine and the single largest file in
+# it is a 33.5 MB decompressed stock kernel. None of it belongs in a repository - and note
+# that a clone cannot run most of these scripts anyway, because the tools assume a populated
+# staging/ next to them. Building that directory is the reader's first job, not the clone's.
+staging/
+
+# Vendor kernel modules recovered from the stock SK-D840N firmware: 18 binaries, 7.2 MiB.
+# These are ZTE/Skyworth proprietary objects, not something this project wrote and not
+# something the licence permits redistributing. They are kept on the machine that pulled
+# them out of the flash; the reverse-engineering notes that describe them (INVENTORY.md,
+# abi-scan.txt and friends) are tracked, which is the part that can be shared.
+pon/vendor-modules/
+
+# Python bytecode from running the tools/ scripts.
+__pycache__/
+*.pyc
+
+# tests/fixtures/stale-set/ holds a *fetched* release artifact, not something this repository
+# wrote: round36-make-fixture.sh pulls four files from the skd840n_flash_21_38243906799
+# release, the largest being a 4.0 MiB jffs2 rootfs. Only the 85-byte sha256 pin is tracked,
+# which is the part that says what the fixture has to be - without it the other three files
+# cannot be checked at all, and with it a reader can rebuild the set byte for byte.
+#
+# Written as a rule rather than as a habit on purpose: `git add tests/` on a machine that has
+# run the fetch script would otherwise stage 4 MiB of release artifact in one keystroke, and
+# the person doing it would not notice until the push.
+tests/fixtures/stale-set/*
+!tests/fixtures/stale-set/sha256sums-release
+
+# tests/rehearse_zrec_gate.sh builds a fake OpenWrt tree - ten synthetic package
+# archives with a rootfs layout inside - next to the workflow it is rehearsing,
+# because the real subject of that gate only exists 74 minutes into a build. All
+# of it is regenerable from the script and none of it is evidence, so it stays out.
+gate-rehearse/
+
+# Board-derived state that the tools read but staging/ does not cover.
+#
+# Measured 2026-10-16 with `git check-ignore`: staging/ is ignored (rule above), backups/ and
+# restore_set/ are NOT. That matters because of the layout question in docs/HANDOFF.md: the
+# shipped tools assume a single clone and look for the pre-flash snapshots and the vendor
+# restore_set/ next to themselves. Acting on that assumption - copying them inside the
+# repository to make preflight walk further - would put 301 MB of board dumps and 268 MB of
+# ZTE firmware one `git add -A` away from a public push. pon/vendor-modules/ above is already
+# refused on exactly this ground, so these two belong beside it rather than in a corner.
+#
+# Reachable without moving anything: mkrollback.sh and checkrollback.sh take LOCAL=<tree>.
+backups/
+restore_set/
+
+# Scratch commit messages written by the commit-message drafting step.  They are a
+# working aid, not source: one `git add -A` away from a public push otherwise.
+.commitmsg-*.txt
+
+# Local scratch used while reading a failed build: Actions JSON, fetched
+# upstream makefiles, drafted commit messages. Not source. A `git add -A`
+# would otherwise publish it.
+work/
+
+# Native tests of the imported protocol engine.
+overlays/package/libs/libzxpon-omci/omci/target/
+
+# Local bootweb builds, firmware payloads, serial captures and device secrets.
+# Keep source, tests and redacted reports trackable; do not ignore *.bin globally.
+/bootweb/.build/
+/device-dumps/
+/scratch/
+/.build/
+/.pytest_cache/
+*.part
+Thumbs.db
+Desktop.ini
+.DS_Store
