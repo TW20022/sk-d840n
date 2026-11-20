@@ -21,6 +21,7 @@ void *memcpy(void *destination, const void *source, size_t count) {
 #define EIO 5
 #define ENODEV 19
 #define ENOTSUPP 524
+#define SPEED_100 100
 #define SPEED_1000 1000
 #define SPEED_2500 2500
 #define PHY_MODE_ETHERNET 1
@@ -54,7 +55,7 @@ struct zx279133_switch {
     struct device *dev;
     void *service;
     struct mutex lane_lock;
-    int lane_work, lane_class;
+    int lane_work, lane_class, applied_outer_speed;
     bool serdes_powered, usxgmii, datapath_ready, xpcs_runtime_held, datapath_held;
 };
 static int on_calls, off_calls, mode_calls, live, fail_on, fail_off, fail_mode;
@@ -104,6 +105,7 @@ static int zx279133_switch_xpcs_read(struct zx279133_switch *p, int mmd, int reg
     (void)p; (void)mmd; (void)reg; return 0x1140;
 }
 static int zx279133_switch_xpcs_program_lane(struct zx279133_switch *p) { (void)p; return fail_words ? -EIO : 0; }
+static int zx279133_switch_xpcs_program_lane_100m(struct zx279133_switch *p) { (void)p; return fail_words ? -EIO : 0; }
 static void cancel_delayed_work_sync(int *p) { (void)p; }
 static void zx279133_lan_service_set_dsa_active(void *p, bool v) { (void)p; (void)v; }
 #define zx279133_lan_service_datapath_set_ready zx279133_lan_service_set_dsa_active
@@ -149,6 +151,12 @@ int main(void) {
     CHECK(apply(SPEED_1000) == 0);
     CHECK(on_calls == 1 && off_calls == 0 && healthy());
     CHECK(xmac_speed == ZX279133_XMAC_SPEED_1G);
+    /* A 100M peer uses the SGMII lane path and the same owned reference. */
+    reset_state(); CHECK(apply(SPEED_100) == 0);
+    CHECK(on_calls == 1 && off_calls == 0 && healthy());
+    CHECK(selected_mode == PHY_INTERFACE_MODE_SGMII);
+    CHECK(xmac_speed == ZX279133_XMAC_SPEED_1G);
+    CHECK(sw.applied_outer_speed == SPEED_100);
     /* Repeated 1G/2.5G changes keep exactly one owned power/PM reference. */
     for (int i = 0; i < 100; ++i) {
         CHECK(apply((i & 1) ? SPEED_1000 : SPEED_2500) == 0);
