@@ -85,6 +85,8 @@ struct zxpon {
 	int los;
 	int lods;
 	uint16_t onu_id;
+	uint16_t alloc_id;
+	int alloc_valid;
 	uint32_t to1_ms;
 	uint32_t to2_ms;
 	uint16_t omcc_gem;
@@ -120,6 +122,7 @@ int zxpon_take_omci(struct zxpon *z, uint8_t out[ZXPON_OMCI_LEN]);
 int zxpon_ploam_pending(const struct zxpon *z);
 int zxpon_data_gem(const struct zxpon *z, uint16_t *gem);
 int zxpon_omcc_gem(const struct zxpon *z, uint16_t *gem);
+int zxpon_alloc_id(const struct zxpon *z, uint16_t *alloc);
 int zxpon_map_gem(struct zxpon *z, uint16_t gem);
 int zxpon_add_tcont(struct zxpon *z, uint16_t alloc_id, int omcc, uint16_t gem);
 int zxpon_set_key(struct zxpon *z, const uint8_t key[ZXPON_KEY_LEN]);

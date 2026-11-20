@@ -759,6 +759,14 @@ int zxpon_omcc_gem(const struct zxpon *z, uint16_t *gem)
 	return 1;
 }
 
+int zxpon_alloc_id(const struct zxpon *z, uint16_t *alloc)
+{
+	if (!z->alloc_valid)
+		return 0;
+	*alloc = z->alloc_id;
+	return 1;
+}
+
 int zxpon_map_gem(struct zxpon *z, uint16_t gem)
 {
 	if (!gem) {
@@ -775,7 +783,12 @@ int zxpon_map_gem(struct zxpon *z, uint16_t gem)
 
 int zxpon_add_tcont(struct zxpon *z, uint16_t alloc_id, int omcc, uint16_t gem)
 {
-	(void)alloc_id;
+	/* The OLT's AllocID is what the hardware T-CONT table needs.  Recording
+	 * it here keeps the value available to the MAC glue once the indirect
+	 * table programming is implemented (docs/108).
+	 */
+	z->alloc_id = alloc_id;
+	z->alloc_valid = 1;
 	if (omcc) {
 		z->omcc_gem = gem;
 		z->omcc_valid = 1;

@@ -49,7 +49,7 @@ standard retry behaviour without flooding the eight-entry queue.
 words and cumulative counters:
 
 ```
-mapped=1 rx_pending=00000000 tx_kick=00000001 rx=0 tx=3 txerr=0 last_rx_id=00 data=0
+mapped=1 rx_pending=00000000 tx_kick=00000001 rx=0 tx=3 txerr=0 last_rx_id=00 data=0 alloc=0000 alloc_valid=0
 ```
 
 `rx` incrementing with `last_rx_id=03` is the direct proof that an OLT answered

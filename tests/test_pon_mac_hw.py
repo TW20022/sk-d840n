@@ -14,7 +14,7 @@ hdr = (KERNEL / "zxpon.h").read_text(encoding="utf-8")
 proto = (KERNEL / "zxpon.c").read_text(encoding="utf-8")
 glue = (KERNEL / "zx279133-pon.c").read_text(encoding="utf-8")
 
-for name in ("zxpon_peek_ploam", "zxpon_retry_sn"):
+for name in ("zxpon_peek_ploam", "zxpon_retry_sn", "zxpon_alloc_id"):
     assert name in hdr, name
     assert ("int " + name) in proto or ("void " + name) in proto, name
 

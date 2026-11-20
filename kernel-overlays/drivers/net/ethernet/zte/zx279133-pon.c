@@ -316,12 +316,20 @@ static DEVICE_ATTR_RO(pon_state);
 static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
+	u16 alloc = 0;
+	int alloc_ok;
+
+	mutex_lock(&zx_pon_lock);
+	alloc_ok = zxpon_alloc_id(&zx_state, &alloc);
+	mutex_unlock(&zx_pon_lock);
 	return sysfs_emit(buf,
 		"mapped=%u rx_pending=%08x tx_kick=%08x "
-		"rx=%u tx=%u txerr=%u last_rx_id=%02x data=%u\n",
+		"rx=%u tx=%u txerr=%u last_rx_id=%02x data=%u "
+		"alloc=%04x alloc_valid=%u\n",
 		zx_pon_hw ? 1 : 0, zx_xmac_r(ZX_PON_RX_PENDING),
 		zx_xmac_r(ZX_PON_TX_KICK), zx_ploam_rx_n, zx_ploam_tx_n,
-		zx_ploam_txerr_n, zx_last_rx_id, zx_hw_data_on);
+		zx_ploam_txerr_n, zx_last_rx_id, zx_hw_data_on,
+		alloc, alloc_ok);
 }
 static DEVICE_ATTR_RO(pon_hw);
 
