@@ -645,6 +645,21 @@ else
 	echo "note: no CONFIG_BUSYBOX_CONFIG_DEVMEM in the build-root config; the RAM image keeps mknod+dd" >&2
 fi
 
+# Build time: every CI run starts from a fresh runner and only openwrt/dl is
+# cached, so the whole toolchain, kernel and several hundred packages are
+# recompiled each time. CONFIG_CCACHE=y wraps the compiler calls; the workflow
+# restores and saves the cache directory across runs. The key there is pinned
+# on the source revisions, not on our tree hash, so a PON source edit reuses
+# the object files of everything we did not touch.
+pin_y_build CCACHE
+grep -qx 'CONFIG_CCACHE=y' .config || {
+	echo "could not enable CONFIG_CCACHE - the build-root config has no such symbol" >&2
+	exit 1
+}
+# ccache stores objects under CCACHE_DIR; the workflow pins that variable to
+# /home/runner/.cache/ccache and caches that same path. Keep the two in step.
+echo "ccache enabled in the build-root config"
+
 echo "== resolved selection =="
 grep -E 'CONFIG_TARGET_zte|CONFIG_EXTERNAL_KERNEL_TREE|CONFIG_TARGET_ROOTFS' .config || true
 grep -q 'CONFIG_TARGET_zte_zx279133_DEVICE_skyworth_sk-d840n=y' .config || {

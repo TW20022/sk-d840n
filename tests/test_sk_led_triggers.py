@@ -25,6 +25,9 @@ STUBS = r'''
 #define LED_OFF 0
 #define LED_FULL 255
 #define ZXPON_O5 5
+#define bool int
+#define true 1
+#define false 0
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
 #define to_delayed_work(ptr) container_of(ptr, struct delayed_work, work)
 #define msecs_to_jiffies(ms) (ms)
@@ -65,6 +68,10 @@ static int zxpon_state(struct zxpon *state) { return state->state; }
 static void netif_carrier_on(struct net_device *dev) { dev->carrier = 1; }
 static void netif_carrier_off(struct net_device *dev) { dev->carrier = 0; }
 static int netif_carrier_ok(struct net_device *dev) { return dev->carrier; }
+/* zxpon_apply_carrier() now also gates the XG-PON MAC data path.  A stub keeps
+ * this LED/state-machine test compiling when the driver gains hardware calls. */
+static int hw_data, hw_data_calls;
+static void zx_pon_hw_data(bool on) { hw_data = on; ++hw_data_calls; }
 '''
 
 CASES = r'''
@@ -113,14 +120,15 @@ int main(void) {
 
     zx_green = &pon; zx_wan = &wan; wan.carrier = 0;
     zx_state.state = ZXPON_O5; zxpon_apply_carrier();
-    CHECK(wan.carrier == 1 && pon_lamp == LED_FULL);
+    CHECK(wan.carrier == 1 && pon_lamp == LED_FULL && hw_data == 1);
     zx_state.state = 1; zxpon_apply_carrier();
-    CHECK(wan.carrier == 0 && pon_lamp == LED_OFF);
+    CHECK(wan.carrier == 0 && pon_lamp == LED_OFF && hw_data == 0);
     pon.subscriber = 0; pon_lamp = LED_OFF;
     for (i = 0; i < 200; ++i) {
         zx_state.state = i & 1 ? ZXPON_O5 : 1;
         zxpon_apply_carrier();
         CHECK(pon_lamp == LED_OFF && wan.carrier == (i & 1));
+        CHECK(hw_data == (i & 1));
     }
     pon_lamp = LED_FULL; zx_state.state = 1; zxpon_apply_carrier();
     CHECK(pon_lamp == LED_FULL && wan.carrier == 0);
@@ -170,7 +178,7 @@ def main():
         assert result.returncode == 0, result.stdout + result.stderr
         result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, f'C assertion failed (line modulo 250 + 1): {result.returncode}\n{source}'
-    print('PASS: actual driver functions: optical/O5 state, 400 manual-override updates, restore-auto, missing sensor/trigger and cleanup order')
+    print('PASS: actual driver functions: optical/O5 state, 400 manual-override updates, restore-auto, missing sensor/trigger, XG-PON MAC data gate and cleanup order')
 
 
 if __name__ == '__main__':

@@ -138,6 +138,12 @@ jobs:
         mode: [initramfs, flash]
     runs-on: ubuntu-22.04
     timeout-minutes: 400
+    env:
+      # Pinned to the path the Cache ccache step persists. ccache otherwise
+      # defaults to XDG ~/.cache/ccache too, but naming it here makes the
+      # save/restore and the compiler agree even if that default changes.
+      CCACHE_DIR: /home/runner/.cache/ccache
+      CCACHE_MAXSIZE: 8G
     steps:
       - uses: actions/checkout@v4
 
@@ -790,6 +796,26 @@ jobs:
           path: openwrt/dl
           key: skd840n-dl-${{ matrix.mode }}-${{ hashFiles('configs/*.config', 'overlays/**') }}
           restore-keys: skd840n-dl-
+
+      # The single biggest cost of this build is recompiling the toolchain,
+      # the kernel and several hundred packages from scratch on every run.
+      # CONFIG_CCACHE=y (pinned in configure-sk-d840n.sh) routes those compiler
+      # calls through ccache. This cache persists them across runs.
+      #
+      # The key deliberately uses only the UPSTREAM source pins, not our tree
+      # hash: ccache already hashes each compiler command line including every
+      # -D/-I and the source content, so a PON driver edit recompiles just that
+      # file and replays every other object. Hashing our tree here would throw
+      # the whole cache away on each PON commit and make this useless.
+      - name: Cache ccache
+        if: steps.pick.outputs.run == 'true' && inputs.clean_cache != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: skd840n-ccache-${{ matrix.mode }}-${{ env.IW_SHA }}-${{ env.KERNEL_SHA }}
+          restore-keys: |
+            skd840n-ccache-${{ matrix.mode }}-
+            skd840n-ccache-
 
       - name: Install feeds
         if: steps.pick.outputs.run == 'true'
