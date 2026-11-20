@@ -2,21 +2,27 @@
 /*
  * XG-PON activation glue for the ZX279133 WAN netdev.
  *
- * The 49-word xgpon_nsyn image is not programmed. The vendor modules on
- * hand have mode_xgpon_nsyn_cfg, not mode_xgpon_nsyn_cfg_133, so that
- * image is not the one this board is allowed to write. The same rule
- * keeps the 0x17000000 PON MAC window untouched: a register is written
- * only when a Hal_WritePonGreg / Hal_WriteXmacReg trace names it, and
- * there is no such trace checked in here.
+ * The 49-word xgpon_nsyn image is still not programmed: the vendor modules
+ * on hand have mode_xgpon_nsyn_cfg, not mode_xgpon_nsyn_cfg_133.  Everything
+ * this file writes is named by a Hal_WriteXmacReg trace disassembled from
+ * zte_xgpon.ko (4.19.136) and decoded in docs/106, and stays inside the
+ * NPPT window the driver already maps.
  *
- * What this file does is the part that can be true with no fibre:
- * the activation state starts at O1, eth0's carrier follows O5, the
- * red LOS input moves the state, and userspace can name one data GEM.
+ * The software activation state machine used to have no hardware layer at
+ * all: it could walk to O2-3 in memory while the PON MAC registers were all
+ * zero.  This file now brings up the XG-PON MAC, writes the ONU serial into
+ * the hardware register, and polls the vendor PLOAM RX/TX windows from the
+ * existing 100 ms tick, feeding received frames into zxpon_rx_ploam() and
+ * draining zxpon's TX queue into the MAC.  GEM/T-CONT provisioning and OMCI
+ * over the data GEM are still separate work.
  */
 
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
+#include <linux/io.h>
 #include <linux/leds.h>
+#include <linux/swab.h>
 #include <net/genetlink.h>
 #include <net/netlink.h>
 
@@ -68,6 +74,178 @@ static int zx_alive;
 static int zx_family_ok;
 static int zx_nb_ok;
 
+/*
+ * The PON MAC window is the same 16 MiB NPPT mapping the driver already
+ * owns.  Every index below is the vendor's Hal_ReadXmacReg /
+ * Hal_WriteXmacReg index; the byte offset is idx * 4, so 0x16147 is
+ * nppt + 0x5851c, exactly where the earlier register probe read zero.
+ */
+#define ZX_XMAC_REG(idx)	(zx_pon_hw + ((idx) << 2))
+#define ZX_PON_RX_PENDING	0x16147
+#define ZX_PON_RX_DATA		0x16148
+#define ZX_PON_TX_KICK		0x16642
+#define ZX_PON_TX_DATA		0x166c2
+
+static void __iomem *zx_pon_hw;
+static u32 zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_txerr_n;
+static u8 zx_last_rx_id;
+static int zx_hw_data_on;
+
+static inline u32 zx_xmac_r(u32 idx)
+{
+	return zx_pon_hw ? readl(ZX_XMAC_REG(idx)) : 0;
+}
+
+static inline void zx_xmac_w(u32 idx, u32 val)
+{
+	if (zx_pon_hw)
+		writel(val, ZX_XMAC_REG(idx));
+}
+
+static inline void zx_xmac_rmw(u32 idx, u32 clear, u32 set)
+{
+	u32 val = zx_xmac_r(idx);
+
+	zx_xmac_w(idx, (val & ~clear) | set);
+}
+
+/* The read-modify-write list below is fi_Configure_Hw_Init() plus
+ * fi_Configure_Pon_Mode(7), transcribed from the AArch64 vendor module.
+ * No shared-PLL or SerDes register appears here: that side was brought up
+ * separately in phy-zx279133-pon-serdes.c and is deliberately untouched.
+ */
+static void zx_pon_hw_bringup(void)
+{
+	u32 val;
+
+	if (!zx_pon_hw)
+		return;
+
+	/* XG-PON (mode 7): mode nibble, mode flag and the 0x3fe preamble. */
+	zx_xmac_rmw(0x6, 0xf, 7);
+	zx_xmac_w(0x1688e, 5);
+	val = (zx_xmac_r(0x1611d) & ~0x3ffu) | 0x3feu | 0xffc00u;
+	zx_xmac_w(0x1611d, val);
+
+	/* Top-level PON enable, held across vendor's 21-step delay loop. */
+	zx_xmac_rmw(0x16000, 0, 0x1f);
+	udelay(100);
+	zx_xmac_rmw(0x1610b, 0, 0x80000);
+	/* Downstream disabled, but the two vendor config bits set. */
+	zx_xmac_rmw(0x16100, 0x1, 0x28);
+	/* Vendor writes byte0=2 then byte1=0x0f, then selects XGS and enables. */
+	val = (zx_xmac_r(0x16644) & ~0xffffu) | 0x1301u;
+	zx_xmac_w(0x16644, val);
+	/* Upstream PLOAM path enabled, normal data upstream held off. */
+	zx_xmac_rmw(0x16600, 0x2 | 0x8, 0x11);
+	zx_xmac_rmw(0x1689f, 0, 0x1);
+	zx_xmac_rmw(0x1a, 0xc, 0);
+	zx_xmac_rmw(0x16001, 0, 0x1);
+	zx_xmac_rmw(0x16501, 0x2, 0x1);
+	zx_xmac_rmw(0x16402, 0x3fff, 0x8);
+	zx_xmac_rmw(0x3000a, 0, 0x1);
+	zx_xmac_rmw(0x16635, 0, 0x1);
+}
+
+/* fi_Configure_Ponmac_Set_Sn(): two byte-swapped words at 0x16636/7. */
+static void zx_pon_hw_set_sn(const u8 sn[ZXPON_SN_LEN])
+{
+	u32 lo, hi;
+
+	if (!zx_pon_hw)
+		return;
+	memcpy(&lo, sn, sizeof(lo));
+	memcpy(&hi, sn + sizeof(lo), sizeof(hi));
+	zx_xmac_w(0x16636, __swab32(lo));
+	zx_xmac_w(0x16637, __swab32(hi));
+}
+
+/* fi_Configure_Ponmac_Set_Gpon_Enable(1): data upstream plus downstream. */
+static void zx_pon_hw_data(bool on)
+{
+	if (!zx_pon_hw || zx_hw_data_on == on)
+		return;
+	if (on) {
+		zx_xmac_rmw(0x16600, 0x1, 0x2);
+		zx_xmac_rmw(0x16100, 0, 0x1);
+	} else {
+		zx_xmac_rmw(0x16600, 0x2, 0x1);
+		zx_xmac_rmw(0x16100, 0x1, 0);
+	}
+	zx_hw_data_on = on;
+}
+
+/* fi_Configure_Interrupt_Read_Ploam_Msg(): pending bit, 12 words, clear. */
+static int zx_pon_hw_ploam_rx(u8 frame[ZXPON_PLOAM_LEN])
+{
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		if (zx_xmac_r(ZX_PON_RX_PENDING) & 1)
+			break;
+	}
+	if (i == 16)
+		return 0;
+	for (i = 0; i < ZXPON_PLOAM_LEN / 4; i++) {
+		u32 word = __swab32(zx_xmac_r(ZX_PON_RX_DATA + i));
+
+		memcpy(frame + i * 4, &word, 4);
+	}
+	zx_xmac_w(ZX_PON_RX_PENDING, 0);
+	return 1;
+}
+
+/* fi_Configure_Ponmac_Send_Ploam_Msg(): wait, 12 words, kick, wait. */
+static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
+{
+	int i, ok = 0;
+
+	for (i = 0; i < 16; i++) {
+		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1))
+			break;
+	}
+	for (i = 0; i < ZXPON_PLOAM_LEN / 4; i++) {
+		u32 word;
+
+		memcpy(&word, frame + i * 4, 4);
+		zx_xmac_w(ZX_PON_TX_DATA + i, __swab32(word));
+	}
+	zx_xmac_w(ZX_PON_TX_KICK, 1);
+	for (i = 0; i < 16; i++) {
+		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1)) {
+			ok = 1;
+			break;
+		}
+	}
+	return ok ? 0 : -ETIMEDOUT;
+}
+
+static void zxpon_poll_ploam(void)
+{
+	u8 frame[ZXPON_PLOAM_LEN];
+	int i;
+
+	if (!zx_pon_hw)
+		return;
+	for (i = 0; i < 4; i++) {
+		if (!zx_pon_hw_ploam_rx(frame))
+			break;
+		zx_ploam_rx_n++;
+		zx_last_rx_id = frame[2];
+		zxpon_rx_ploam(&zx_state, frame);
+	}
+	for (i = 0; i < 4; i++) {
+		if (!zxpon_peek_ploam(&zx_state, frame))
+			break;
+		if (zx_pon_hw_ploam_tx(frame)) {
+			zx_ploam_txerr_n++;
+			break;
+		}
+		zxpon_take_ploam(&zx_state, frame);
+		zx_ploam_tx_n++;
+	}
+}
+
 static void zxpon_apply_carrier(void)
 {
 	int o5;
@@ -82,13 +260,22 @@ static void zxpon_apply_carrier(void)
 			netif_carrier_off(zx_wan);
 	}
 	led_trigger_event(zx_green, o5 ? LED_FULL : LED_OFF);
+	zx_pon_hw_data(o5);
 }
 
 static void zxpon_tick_work(struct work_struct *work)
 {
+	static unsigned int sn_tick;
+
 	mutex_lock(&zx_pon_lock);
-	if (zx_alive)
+	if (zx_alive) {
 		zxpon_tick(&zx_state, 100);
+		if (++sn_tick >= 10) {
+			sn_tick = 0;
+			zxpon_retry_sn(&zx_state);
+		}
+		zxpon_poll_ploam();
+	}
 	mutex_unlock(&zx_pon_lock);
 	zxpon_apply_carrier();
 	if (zx_alive)
@@ -121,6 +308,22 @@ static ssize_t pon_state_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%s\n", name);
 }
 static DEVICE_ATTR_RO(pon_state);
+
+/* Read-only view of the newly wired MAC path.  These counters are the fast
+ * way to tell "no downstream PLOAM" from "software never sent a frame"
+ * without attaching a packet socket to the OMCI netdev.
+ */
+static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	return sysfs_emit(buf,
+		"mapped=%u rx_pending=%08x tx_kick=%08x "
+		"rx=%u tx=%u txerr=%u last_rx_id=%02x data=%u\n",
+		zx_pon_hw ? 1 : 0, zx_xmac_r(ZX_PON_RX_PENDING),
+		zx_xmac_r(ZX_PON_TX_KICK), zx_ploam_rx_n, zx_ploam_tx_n,
+		zx_ploam_txerr_n, zx_last_rx_id, zx_hw_data_on);
+}
+static DEVICE_ATTR_RO(pon_hw);
 
 static bool zxpon_omci_channel(u16 *gem)
 {
@@ -194,6 +397,7 @@ static int zxpon_nl_set_identity(struct sk_buff *skb, struct genl_info *info)
 	regid = nla_data(info->attrs[ZXPON_A_REGID]);
 	mutex_lock(&zx_pon_lock);
 	zxpon_set_identity(&zx_state, sn, regid);
+	zx_pon_hw_set_sn(sn);
 	/*
 	 * Identity is the real readiness signal on this board: the opsd GPIO
 	 * stays low and lods has no clear path, so clear both here and let
@@ -368,6 +572,7 @@ void zx279133_pon_carrier_kick(struct net_device *ndev)
 
 void zx279133_pon_attach(struct net_device *ndev)
 {
+	struct zx279133_eth *eth = netdev_priv(ndev);
 	int rc;
 
 	if (zx_alive)
@@ -378,10 +583,18 @@ void zx279133_pon_attach(struct net_device *ndev)
 	zx_activation_armed = 0;
 	zxpon_init(&zx_state);
 	zx_wan = ndev;
+	/* The NPPT mapping is already established at this point in probe. */
+	zx_pon_hw = eth->base;
+	if (zx_pon_hw)
+		zx_pon_hw_bringup();
+	else
+		dev_warn(&ndev->dev, "PON MAC window not mapped; PLOAM disabled\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_state))
 		dev_warn(&ndev->dev, "pon_state sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_omci_transport))
 		dev_warn(&ndev->dev, "omci_transport sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_hw))
+		dev_warn(&ndev->dev, "pon_hw sysfs not created\n");
 	zx_omci = alloc_netdev(0, "omci", NET_NAME_UNKNOWN, zxpon_omci_setup);
 	if (zx_omci) {
 		zx_omci->dev.parent = ndev->dev.parent;
@@ -424,7 +637,10 @@ void zx279133_pon_stop(void)
 	if (zx_wan) {
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_state);
 		device_remove_file(&zx_wan->dev, &dev_attr_omci_transport);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_hw);
 	}
+	zx_pon_hw = NULL;
+	zx_hw_data_on = 0;
 	if (zx_omci) {
 		unregister_netdev(zx_omci);
 		zx_omci = NULL;

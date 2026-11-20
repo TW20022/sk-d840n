@@ -490,6 +490,30 @@ int zxpon_take_ploam(struct zxpon *z, uint8_t out[48])
 	return 1;
 }
 
+int zxpon_peek_ploam(const struct zxpon *z, uint8_t out[ZXPON_PLOAM_LEN])
+{
+	if (z->ploam_tx_n <= 0)
+		return 0;
+	memcpy(out, z->ploam_tx[0], ZXPON_PLOAM_LEN);
+	return 1;
+}
+
+/* G.987.3 retries the serial-number PLOAM while the ONU waits in O2-3.  The
+ * hardware layer must only dequeue a frame once the MAC has accepted it, so
+ * the driver polls this API every tick instead of dropping the queue entry.
+ */
+void zxpon_retry_sn(struct zxpon *z)
+{
+	int i;
+
+	if (z->state != ZXPON_O23 || z->los || z->lods || !z->has_identity)
+		return;
+	for (i = 0; i < z->ploam_tx_n; i++)
+		if (z->ploam_tx[i][2] == ZXPON_US_SERIAL_NUMBER)
+			return;
+	zxpon_queue_sn(z);
+}
+
 int zxpon_ploam_pending(const struct zxpon *z)
 {
 	return z->ploam_tx_n;

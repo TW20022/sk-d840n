@@ -114,6 +114,8 @@ int zxpon_rx_omci(struct zxpon *z, const uint8_t frame[ZXPON_OMCI_LEN]);
 enum zxpon_state zxpon_state(const struct zxpon *z);
 const char *zxpon_state_name(const struct zxpon *z);
 int zxpon_take_ploam(struct zxpon *z, uint8_t out[ZXPON_PLOAM_LEN]);
+int zxpon_peek_ploam(const struct zxpon *z, uint8_t out[ZXPON_PLOAM_LEN]);
+void zxpon_retry_sn(struct zxpon *z);
 int zxpon_take_omci(struct zxpon *z, uint8_t out[ZXPON_OMCI_LEN]);
 int zxpon_ploam_pending(const struct zxpon *z);
 int zxpon_data_gem(const struct zxpon *z, uint16_t *gem);

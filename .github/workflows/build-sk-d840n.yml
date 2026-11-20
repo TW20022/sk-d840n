@@ -199,6 +199,7 @@ jobs:
           {
             node tests/test_sk_pon_ui.js &&
             python3 tests/test_sk_pon_contract.py &&
+            python3 tests/test_pon_mac_hw.py &&
             python3 tests/test_sk_pon_firstboot.py &&
             python3 tests/test_sk_pon_theme.py &&
             python3 tests/test_sk_lan1_led.py &&
