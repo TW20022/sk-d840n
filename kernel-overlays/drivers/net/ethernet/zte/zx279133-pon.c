@@ -41,6 +41,22 @@ static struct net_device *zx_omci;
 static struct led_trigger *zx_green;
 
 /*
+ * This board's optical RX signal detect (opsd-gpio = gpio2 pin 1) is not
+ * driven until the BOSA analogue front end is initialised.  In a mainline
+ * boot that never happens, so pon_led_work() reads it low forever and calls
+ * note_rxsd(0), which keeps z->los = 1.  Nothing in the real driver path
+ * ever clears z->lods either.  Both bits gate zxpon_try_o23(), so a valid
+ * identity cannot move the machine out of O1 even with a live OLT above.
+ *
+ * Once an identity is configured we arm the activation and stop letting a
+ * low opsd kick us back to O1: send the serial number and let the PLOAM
+ * state machine find out whether the OLT is really there (the standard
+ * O1 timer still falls back if downstream frames never arrive).  The LED
+ * still follows the raw GPIO, so the panel lamp remains honest.
+ */
+static int zx_activation_armed;
+
+/*
  * The family is filled in further down, next to the ops table that has to
  * exist before it can be named - and the reply path below needs the family
  * before that.  A tentative definition is the C way of saying "it comes
@@ -178,6 +194,14 @@ static int zxpon_nl_set_identity(struct sk_buff *skb, struct genl_info *info)
 	regid = nla_data(info->attrs[ZXPON_A_REGID]);
 	mutex_lock(&zx_pon_lock);
 	zxpon_set_identity(&zx_state, sn, regid);
+	/*
+	 * Identity is the real readiness signal on this board: the opsd GPIO
+	 * stays low and lods has no clear path, so clear both here and let
+	 * try_o23() run.  Fail-safe O1 timers remain active in zxpon.c.
+	 */
+	zxpon_set_lods(&zx_state, 0);
+	zxpon_set_los(&zx_state, 0);
+	zx_activation_armed = 1;
 	mutex_unlock(&zx_pon_lock);
 	zxpon_apply_carrier();
 	return 0;
@@ -323,7 +347,12 @@ void zx279133_pon_note_rxsd(int light)
 	if (!zx_alive)
 		return;
 	mutex_lock(&zx_pon_lock);
-	zxpon_set_los(&zx_state, light ? 0 : 1);
+	/* A low opsd after activation is the uninitialised BOSA signal detect,
+	 * not proof of a dark fibre.  Ignore it so the PLOAM state machine is
+	 * not reset to O1 on every 200 ms poll.  A high opsd is always honoured.
+	 */
+	if (light || !zx_activation_armed)
+		zxpon_set_los(&zx_state, light ? 0 : 1);
 	mutex_unlock(&zx_pon_lock);
 	zxpon_apply_carrier();
 }
@@ -346,6 +375,7 @@ void zx279133_pon_attach(struct net_device *ndev)
 	led_trigger_register_simple("zx279133-pon", &zx_green);
 	if (!zx_green)
 		dev_warn(&ndev->dev, "PON LED trigger unavailable\n");
+	zx_activation_armed = 0;
 	zxpon_init(&zx_state);
 	zx_wan = ndev;
 	if (device_create_file(&ndev->dev, &dev_attr_pon_state))
@@ -385,6 +415,7 @@ void zx279133_pon_stop(void)
 	if (!zx_alive)
 		return;
 	zx_alive = 0;
+	zx_activation_armed = 0;
 	cancel_delayed_work_sync(&zx_tick);
 	if (zx_nb_ok) {
 		unregister_netdevice_notifier(&zxpon_net_nb);
