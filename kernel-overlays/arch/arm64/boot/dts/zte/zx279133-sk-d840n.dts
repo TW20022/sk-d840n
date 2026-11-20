@@ -379,6 +379,21 @@
 };
 
 &pon_serdes {
+	/*
+	 * This is the optical lane, and the vendor's own bootloader proves what
+	 * it runs: "enter gpon pon pll cfg / mode_xgpon_nsyn_cfg_133 /
+	 * com_pll_lock_ready / rx los =0 rx data in / cdr_lock_ready / pon
+	 * serdes init succeed".  Mode 6 in the bootloader's table is
+	 * mode_xgpon_nsyn_cfg_133, a 49-word image at 0x16000000..0x160000c0
+	 * plus the GPON PLL setting in TOPCRM - both recovered from the boot
+	 * partition and now carried by the driver.
+	 *
+	 * The image is not a host interface choice, so it cannot be reached by
+	 * changing phy-mode on the nppt below: an earlier round of this file
+	 * tried exactly that and there is no Interface value that yields an
+	 * XG-PON PLL.  Hence a property of its own.
+	 */
+	zte,xgpon-nsyn;
 	status = "okay";
 };
 
@@ -413,9 +428,11 @@
 	 *     the 9132's CPU port.  The 9132's own driver owns that lane, the
 	 *     same way the RTL8372N driver owns it on the SR1010.
 	 *
- * xgpon_nsyn is not selected here: mode_xgpon_nsyn_cfg_133 did not
- * yield a 49-word image, so this lane stays SGMII and the state machine
- * does not invent a SerDes profile.
+ * xgpon_nsyn is not selected by phy-mode, and that is now settled rather
+ * than open: the image the bootloader writes is mode 6 of its own table,
+ * mode_xgpon_nsyn_cfg_133, and no phy_interface_t maps onto it.  The lane
+ * therefore takes it from the board property on &pon_serdes above, while
+ * "sgmii" here is what the host side asks for and nothing more.
 	 * The PON SerDes driver accepts both SGMII and 2.5GBASE-X, so "sgmii"
 	 * is a mode it can actually be put into.  The Uni SerDes and XPCS0 are
 	 * left for the switch driver below.
