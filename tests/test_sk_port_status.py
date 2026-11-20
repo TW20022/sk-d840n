@@ -87,6 +87,11 @@ check("PHYSR" in body and "mdiobus_c45_read" in body, "outer link state reads PH
 check("0x00" not in body and body.count("mdiobus_c45_read") == 1,
       "outer link state performs one MDIO read and does not touch AN BMCR")
 
+apply_body = func_body(src, "zx279133_switch_outerphy_apply_speed_locked")
+check("zx279133_switch_xpcs_program_lane_100m" in src and
+      "SPEED_100" in apply_body,
+      "the LAN1 lane has a real 100M SGMII branch, not a 1G fallback")
+
 dts = DTS.read_text(encoding="utf-8")
 check(port_label(dts, 8) == "lan1", "DSA port 8, the panel LAN1, is netdev lan1")
 check(port_label(dts, 4) == "lan0", "DSA port 4, the jackless port, is netdev lan0")

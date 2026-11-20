@@ -312,6 +312,20 @@
 #define ZX279133_XPCS_2G5_SR_MII_SPEED	0x0020
 #define ZX279133_XPCS_2G5_DIG_CTRL1	0x2000
 #define ZX279133_XPCS_2G5_AN_CTRL	0x0000
+/*
+ * The 100M SGMII image.  The lane itself still runs at 1.25 Gbaud, exactly
+ * as it does for a 1G peer: SGMII carries the resolved copper rate in the
+ * SR-MII control word and in the auto-negotiation code word.  U-Boot's
+ * 0x1140 is the 1G image; the vendor's xpcs_sgmii_mode_conf() passes speed
+ * 1 for this case, which sets BMCR bit 13 (100M) instead of bit 6 (1G) and
+ * leaves AN and full duplex on.  The other three words stay at the loader's
+ * SGMII values, because the vendor's own SGMII path does not rewrite them
+ * and those are the values the lane is known to carry frames with.
+ */
+#define ZX279133_XPCS_100M_BMCR		0x3100
+#define ZX279133_XPCS_100M_SR_MII_SPEED	0x0020
+#define ZX279133_XPCS_100M_DIG_CTRL1	0x2200
+#define ZX279133_XPCS_100M_AN_CTRL	0x0005
 #define ZX279133_XPCS_DUPLEX		BIT(8)
 #define ZX279133_XPCS_PSEQ_MASK		GENMASK(4, 2)
 #define ZX279133_XPCS_PSEQ_IDLE		0x4
@@ -596,6 +610,13 @@ struct zx279133_switch {
 	int outer_speed;
 	int outer_duplex;
 	bool outer_link;
+	/*
+	 * The rate the lane was last programmed for.  The copper side of the
+	 * 2.5G jack can renegotiate between 100M/1G/2.5G without the SerDes
+	 * class changing; without this the lane would keep the first rate it
+	 * was given for the whole boot.
+	 */
+	int applied_outer_speed;
 	phy_interface_t outer_interface;
 	/*
 	 * The bus of the switch's own, which the four user ports' PHYs are
@@ -858,6 +879,31 @@ static int zx279133_switch_xpcs_program_lane(struct zx279133_switch *priv)
 }
 
 /*
+ * The same four words, with the BMCR carrying the 100M SGMII code.
+ *
+ * This is the missing branch: the old driver treated every rate below
+ * 2.5G as 1G and wrote U-Boot's 1G BMCR last, so a 100M peer on LAN1 saw a
+ * lane that advertised 1G and never produced a valid code stream.
+ */
+static int zx279133_switch_xpcs_program_lane_100m(struct zx279133_switch *priv)
+{
+	int ret;
+
+	ret = zx279133_switch_xpcs_write_words(priv,
+					ZX279133_XPCS_100M_BMCR,
+					ZX279133_XPCS_100M_SR_MII_SPEED,
+					ZX279133_XPCS_100M_DIG_CTRL1,
+					ZX279133_XPCS_100M_AN_CTRL);
+	if (ret)
+		return ret;
+
+	dev_info(priv->dev,
+		 "the 2.5G jack: lane programmed for 100M SGMII (BMCR 0x%04x)\n",
+		 ZX279133_XPCS_100M_BMCR);
+	return 0;
+}
+
+/*
  * The lane, watched.
  *
  * The switch driver programs the lane once, at probe.  The NPPT's prepare
@@ -905,6 +951,14 @@ static void zx279133_switch_lane_work_cleanup(void *data);
  * changes, and prints the PHY's own configuration once per boot.
  */
 static int zx279133_switch_outerphy_link(struct zx279133_switch *priv);
+
+/*
+ * The copper rate of the 2.5G jack, when the RTL8226 says the link is up.
+ * Forwarded so the lane watcher can follow renegotiations; the definition
+ * sits with the other PHYSR readers below.
+ */
+static bool zx279133_switch_outerphy_current_speed(struct zx279133_switch *priv,
+						    int *speed);
 
 /*
  * The far end's SerDes class: forward declarations.
@@ -979,6 +1033,30 @@ static void zx279133_switch_lane_watch(struct work_struct *work)
 	zx279133_switch_outerphy_link(priv);
 
 	/*
+	 * Follow the copper rate.  The SerDes class only distinguishes 1G and
+	 * 2.5G; a jack that renegotiates from 1G down to 100M leaves the class
+	 * unchanged, and the old driver kept the 1G lane image for the whole
+	 * boot.  Reprogram only on a real change and only while the link is up.
+	 */
+	{
+		int copper_speed;
+
+		if (zx279133_switch_outerphy_current_speed(priv, &copper_speed) &&
+		    copper_speed != priv->applied_outer_speed) {
+			ret = zx279133_switch_outerphy_apply_speed(priv,
+								  copper_speed);
+			if (ret)
+				dev_warn(priv->dev,
+					 "the 2.5G jack: failed to follow a %d Mbps link (%d)\n",
+					 copper_speed, ret);
+			else
+				dev_info(priv->dev,
+					 "the 2.5G jack: followed a %d Mbps link\n",
+					 copper_speed);
+		}
+	}
+
+	/*
 	 * The far end's SerDes class is the one thing on this lane that the
 	 * board itself can take away, and none of the words read above tells
 	 * that apart from a lane that works: the far end's auto-negotiation
@@ -1051,9 +1129,14 @@ static void zx279133_switch_lane_watch(struct work_struct *work)
 		priv->lane_tries = 0;
 	}
 	{
-		int speed = (priv->lane_seen == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5 ||
-			     priv->lane_class == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5) ?
-			SPEED_2500 : SPEED_1000;
+		int speed = SPEED_1000;
+
+		if (priv->applied_outer_speed == SPEED_100 ||
+		    priv->applied_outer_speed == SPEED_2500)
+			speed = priv->applied_outer_speed;
+		else if (priv->lane_seen == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5 ||
+			 priv->lane_class == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5)
+			speed = SPEED_2500;
 
 		ret = zx279133_switch_outerphy_apply_speed(priv, speed);
 	}
@@ -1082,9 +1165,13 @@ rearm:
 		     cls == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5) &&
 		    cls != priv->lane_seen) {
 			priv->lane_seen = cls;
-			zx279133_switch_outerphy_apply_speed(priv,
-				cls == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5 ?
-				SPEED_2500 : SPEED_1000);
+			if (cls == ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5)
+				zx279133_switch_outerphy_apply_speed(priv,
+								      SPEED_2500);
+			else
+				zx279133_switch_outerphy_apply_speed(priv,
+					priv->applied_outer_speed == SPEED_100 ?
+					SPEED_100 : SPEED_1000);
 		}
 	}
 	/*
@@ -3119,6 +3206,27 @@ static bool zx279133_switch_physr_decode(u16 raw, int *speed, int *duplex,
 	return true;
 }
 
+static bool zx279133_switch_outerphy_current_speed(struct zx279133_switch *priv,
+						    int *speed)
+{
+	struct mii_bus *bus = zx279133_switch_outer_mdio(priv);
+	int raw, decoded_speed, duplex;
+	bool link;
+
+	if (!bus)
+		return false;
+	raw = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
+			       ZX279133_SWITCH_OUTERPHY_PHYSR_DEVAD,
+			       ZX279133_SWITCH_OUTERPHY_PHYSR);
+	if (raw < 0 ||
+	    !zx279133_switch_physr_decode((u16)raw, &decoded_speed, &duplex,
+					  &link) ||
+	    !link)
+		return false;
+	*speed = decoded_speed;
+	return true;
+}
+
 /* 1000base-x at 1G and below, 2500base-x at 2.5G. Both are already in
  * phylink_get_caps() for this port. A 1000 report left on 2500base-x is
  * what made the fixed link keep saying 2.5G.
@@ -3993,6 +4101,7 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 {
 	phy_interface_t iface;
 	u32 speed_code;
+	int link_speed = speed;
 	int ret;
 
 	if (IS_ERR_OR_NULL(priv->serdes))
@@ -4003,6 +4112,18 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 		speed_code = ZX279133_XMAC_SPEED_2P5G;
 		dev_info(priv->dev,
 			 "the 2.5G jack's PHY: system side at 2500 Mbps; programming the lane to match\n");
+	} else if (speed == SPEED_100) {
+		/*
+		 * The XMAC stays at the SGMII 1G code: the vendor's own
+		 * xmac_sgmii_conf() passes 3 to xamc_init_conf_by_speed()
+		 * whatever the copper side negotiated.  What has to change is
+		 * the lane's SR-MII control word, so the 1.25 Gbaud lane
+		 * carries a 100M code instead of a 1G one.
+		 */
+		iface = PHY_INTERFACE_MODE_SGMII;
+		speed_code = ZX279133_XMAC_SPEED_1G;
+		dev_info(priv->dev,
+			 "the 2.5G jack's PHY: system side at 100M SGMII; the XMAC stays at the 1G SGMII code\n");
 	} else {
 		iface = PHY_INTERFACE_MODE_SGMII;
 		speed_code = ZX279133_XMAC_SPEED_1G;
@@ -4031,7 +4152,7 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 
 	if (!priv->xpcs_mdiodev)
 		return -ENODEV;
-	if (speed == SPEED_2500)
+	if (link_speed == SPEED_2500)
 		ret = zx279133_switch_xpcs_2500basex(priv);
 	else
 		ret = zx279133_switch_xpcs_sgmii(priv);
@@ -4081,28 +4202,35 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 	 * it does not, the log says so and the next question is what takes it
 	 * down.
 	 */
-	if (speed != SPEED_2500) {
+	if (link_speed != SPEED_2500) {
 		int before = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2,
 							MII_BMCR);
 		int after;
 
-		ret = zx279133_switch_xpcs_program_lane(priv);
+		if (link_speed == SPEED_100)
+			ret = zx279133_switch_xpcs_program_lane_100m(priv);
+		else
+			ret = zx279133_switch_xpcs_program_lane(priv);
 		if (ret)
 			return ret;
 		after = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2,
 						  MII_BMCR);
 		dev_info(priv->dev,
-			 "the 2.5G jack: the lane's BMCR was 0x%04x and is 0x%04x after the loader's words were written again\n",
+			 "the 2.5G jack: the lane's BMCR was 0x%04x and is 0x%04x after the final lane words were written again\n",
 			 before < 0 ? 0xffff : before,
 			 after < 0 ? 0xffff : after);
 	}
 
-	priv->lane_class = speed == SPEED_2500 ?
+	priv->lane_class = link_speed == SPEED_2500 ?
 		ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5 :
 		ZX279133_SWITCH_OUTERPHY_SERDES_MODE_1G;
-	if (speed == SPEED_2500)
+	priv->applied_outer_speed = link_speed;
+	if (link_speed == SPEED_2500)
 		dev_info(priv->dev,
 			 "the 2.5G jack: lane programmed for 2500BASE-X (speed 6)\n");
+	else if (link_speed == SPEED_100)
+		dev_info(priv->dev,
+			 "the 2.5G jack: lane programmed for 100M SGMII (XMAC speed 3)\n");
 	else
 		dev_info(priv->dev,
 			 "the 2.5G jack: lane programmed for 1G (speed 3)\n");
@@ -4148,6 +4276,7 @@ static int zx279133_switch_probe(struct platform_device *pdev)
 
 	priv->dev = dev;
 	dev_set_drvdata(dev, priv);
+	priv->applied_outer_speed = SPEED_UNKNOWN;
 	mutex_init(&priv->lane_lock);
 	INIT_DELAYED_WORK(&priv->lane_work, zx279133_switch_lane_watch);
 	/*
