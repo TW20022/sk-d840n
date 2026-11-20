@@ -379,6 +379,15 @@
 };
 
 &pon_serdes {
+	/*
+	 * Select the optical lane's XG-PON NSYN image (U-Boot mode 6,
+	 * mode_xgpon_nsyn_cfg_133), recovered from this board's boot partition.
+	 * This property only picks the 49-word image written into the PON lane's
+	 * own register window at 0x16000000.  The shared TOPCRM PLL/mux in
+	 * configure_pll() is deliberately left in its stock Ethernet setting so
+	 * the RJ45/br-lan clock is not disturbed.
+	 */
+	zte,xgpon-nsyn;
 	status = "okay";
 };
 
@@ -413,11 +422,12 @@
 	 *     the 9132's CPU port.  The 9132's own driver owns that lane, the
 	 *     same way the RTL8372N driver owns it on the SR1010.
 	 *
- * xgpon_nsyn is not selected here: mode_xgpon_nsyn_cfg_133 did not
- * yield a 49-word image, so this lane stays SGMII and the state machine
- * does not invent a SerDes profile.
-	 * The PON SerDes driver accepts both SGMII and 2.5GBASE-X, so "sgmii"
-	 * is a mode it can actually be put into.  The Uni SerDes and XPCS0 are
+	 * The XG-PON image is chosen by the board property on &pon_serdes above,
+	 * not by this phy-mode: no phy_interface_t maps onto U-Boot mode 6.
+	 * "sgmii" is only what the host side asks the lane driver for.  The PON
+	 * SerDes driver accepts SGMII and 2.5GBASE-X, so "sgmii" is a mode it
+	 * can actually be put into; the XG-PON image wins via the property while
+	 * the shared clock path stays untouched.  The Uni SerDes and XPCS0 are
 	 * left for the switch driver below.
 	 */
 	phy-mode = "sgmii";
