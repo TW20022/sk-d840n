@@ -1913,13 +1913,30 @@ static void zx279133_switch_sopc_publish(struct zx279133_switch *priv)
 				ZX279133_XMAC_SOPC_READY_BASE + 4 * i);
 			if (ready & BIT(0))
 				break;
-			usleep_range(1000, 1100);
+			/*
+			 * The vendor waits ten times, 4.29 ms apart, not 1 ms:
+			 * it is the same clear-over-ready handshake smac_init()
+			 * uses for the four SMACs, and on a 100M peer the XMAC0
+			 * word can take the full window to come up.  Publishing
+			 * before it is up writes a send-enable the SOPC ignores.
+			 */
+			usleep_range(4200, 4400);
 		}
 		if (!(ready & BIT(0)))
 			dev_warn(dev,
 				 "SOPC mac %d never became ready (0x%08x); not publishing it\n",
 				 i, ready);
+		else
+			/*
+			 * The vendor waits one more slot after ready is seen,
+			 * and writes the send-enable twice, exactly as
+			 * smac_init() does for the SMACs.
+			 */
+			usleep_range(4200, 4400);
 
+		zx279133_switch_nppt_write(priv,
+					   ZX279133_XMAC_SOPC_SEND_BASE + 4 * i,
+					   1);
 		zx279133_switch_nppt_write(priv,
 					   ZX279133_XMAC_SOPC_SEND_BASE + 4 * i,
 					   1);
@@ -4055,7 +4072,7 @@ static int zx279133_switch_xpcs_2500basex(struct zx279133_switch *priv)
 }
 
 static void zx279133_switch_xmac_set_speed(struct zx279133_switch *priv,
-					   u32 speed_code)
+					   u32 speed_code, bool do_reset)
 {
 	u32 xmac = ZX279133_XMAC0_BASE;
 	u32 value;
@@ -4068,6 +4085,42 @@ static void zx279133_switch_xmac_set_speed(struct zx279133_switch *priv,
 	zx279133_switch_nppt_write(priv, xmac + ZX279133_XMAC_TX_CTRL,
 				    value & ~ZX279133_XMAC_ENABLE);
 	zx279133_switch_nppt_write(priv, ZX279133_XMAC0_SOPC_SEND, 0);
+
+	/*
+	 * A 100M peer needs the XMAC0 clear-over-ready word (nppt+0x342a4)
+	 * brought up the way smac_init() brings up the four SMACs: pulse this
+	 * MAC's bit in the shared soft-reset word, wait the vendor's 1.7 ms,
+	 * and set it again, all while the MAC is disabled and its SOPC
+	 * send-enable dropped (just above).  Without the pulse the word stays
+	 * 0 on a 100M peer, sopc_publish() below has nothing to publish to,
+	 * and no frame reaches the IDM - RX stays 0 even though the lane
+	 * carries code (docs/92 §96.48, lan1_96_48_revival §3).
+	 *
+	 * This is done here, in the probe-time lane programme, NOT as a
+	 * runtime toggle: the historical runtime pulse made the ready bit
+	 * flicker 0->1->0 but never restored the datapath, because it tore
+	 * down an already-armed MAC.  At probe time the pulse precedes the
+	 * program + publish + enable sequence, which is the vendor's order.
+	 *
+	 * The bit is XMAC0-only (bit 10 of 0x2c0004); the PCS and the four
+	 * SMACs live on other bits, so this does not disturb the lane the
+	 * bootloader brought up.  Only the 100M path asks for it; 1G and
+	 * 2.5G keep the exact sequence that is already known to work.
+	 */
+	if (do_reset) {
+		value = zx279133_switch_nppt_read(priv,
+						  ZX279133_SYS_SOFT_RESET);
+		zx279133_switch_nppt_write(priv, ZX279133_SYS_SOFT_RESET,
+					    value & ~ZX279133_XMAC0_RESET);
+		usleep_range(ZX279133_XMAC_RESET_US,
+			     ZX279133_XMAC_RESET_US + 100);
+		zx279133_switch_nppt_write(priv, ZX279133_SYS_SOFT_RESET,
+					    value | ZX279133_XMAC0_RESET);
+		dev_info(priv->dev,
+			 "the 2.5G jack: XMAC0 reset pulsed for the 100M peer (ready=0x%08x)\n",
+			 zx279133_switch_nppt_read(priv,
+					ZX279133_XMAC_SOPC_READY_BASE));
+	}
 
 	zx279133_switch_xmac_program(priv, speed_code);
 
@@ -4170,7 +4223,9 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 	if (ret)
 		return ret;
 
-	zx279133_switch_xmac_set_speed(priv, speed_code);
+	/* Only the 100M path needs the XMAC0 reset pulse before publish. */
+	zx279133_switch_xmac_set_speed(priv, speed_code,
+				       link_speed == SPEED_100);
 
 	/*
 	 * The loader's four words, once more, and last.
