@@ -4116,10 +4116,22 @@ static void zx279133_switch_xmac_set_speed(struct zx279133_switch *priv,
 			     ZX279133_XMAC_RESET_US + 100);
 		zx279133_switch_nppt_write(priv, ZX279133_SYS_SOFT_RESET,
 					    value | ZX279133_XMAC0_RESET);
+		/*
+		 * Do not read the ready word here.  It is read-clear: a
+		 * diagnostic read in this line ate the one clear-over-ready the
+		 * pulse produces, and sopc_publish() below then read 0 ten times
+		 * in a row and never saw the handshake it was waiting for.
+		 *
+		 * Measured on the board, 2026-11-23: pulse, no read in between,
+		 * first read 1 s later = 0x00000001, the read after that =
+		 * 0x00000000.
+		 *
+		 * The reset word itself is safe to read, so it is what gets
+		 * printed.
+		 */
 		dev_info(priv->dev,
-			 "the 2.5G jack: XMAC0 reset pulsed for the 100M peer (ready=0x%08x)\n",
-			 zx279133_switch_nppt_read(priv,
-					ZX279133_XMAC_SOPC_READY_BASE));
+			 "the 2.5G jack: XMAC0 reset pulsed for the 100M peer (reset word 0x%08x)\n",
+			 zx279133_switch_nppt_read(priv, ZX279133_SYS_SOFT_RESET));
 	}
 
 	zx279133_switch_xmac_program(priv, speed_code);
