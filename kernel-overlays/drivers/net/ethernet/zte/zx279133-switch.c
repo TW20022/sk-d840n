@@ -315,14 +315,22 @@
 /*
  * The 100M SGMII image.  The lane itself still runs at 1.25 Gbaud, exactly
  * as it does for a 1G peer: SGMII carries the resolved copper rate in the
- * SR-MII control word and in the auto-negotiation code word.  U-Boot's
- * 0x1140 is the 1G image; the vendor's xpcs_sgmii_mode_conf() passes speed
- * 1 for this case, which sets BMCR bit 13 (100M) instead of bit 6 (1G) and
- * leaves AN and full duplex on.  The other three words stay at the loader's
- * SGMII values, because the vendor's own SGMII path does not rewrite them
- * and those are the values the lane is known to carry frames with.
+ * SR-MII control word and in the auto-negotiation code word.  The BMCR must
+ * therefore stay at the loader's 0x1140 (bit 6, 1000BASE-X speed) for a 100M
+ * peer too -- it is NOT a copper-rate field.
+ *
+ * 2026-11-22 on-board measurement: writing 0x3100 (bit 13, the "100M" code)
+ * here makes the far-end RTL8226's AN status stick at 0x002d, missing bit
+ * 0x40 -- "the lane carries no code" -- so rx_packets stays at 0 and the
+ * link never passes traffic.  Writing the loader's 0x1140 instead brings the
+ * AN status back to 0x0069 (all four lane bits set) and the lane carries
+ * code, exactly as it does for a 1G peer.  The datapath was already armed at
+ * boot under 0x1140 (6.36s "lane programmed for 1G", 7.40s "datapath
+ * enabled"); switching BMCR to 0x3100 afterwards is what kills it (9.47s).
+ * Keep 0x1140 so the 100M re-program is a no-op on the BMCR and the armed
+ * lane survives.  The copper rate is carried by SR-MII, not by BMCR.
  */
-#define ZX279133_XPCS_100M_BMCR		0x3100
+#define ZX279133_XPCS_100M_BMCR		0x1140
 #define ZX279133_XPCS_100M_SR_MII_SPEED	0x0020
 #define ZX279133_XPCS_100M_DIG_CTRL1	0x2200
 #define ZX279133_XPCS_100M_AN_CTRL	0x0005
