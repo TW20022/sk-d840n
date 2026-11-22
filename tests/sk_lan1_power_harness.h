@@ -100,7 +100,7 @@ static int zx279133_switch_xpcs_sgmii(struct zx279133_switch *p) { (void)p; retu
 static int zx279133_switch_xpcs_bypass(struct zx279133_switch *p, bool enable) {
     (void)p; (void)enable; return fail_bypass ? -EIO : 0;
 }
-static void zx279133_switch_xmac_set_speed(struct zx279133_switch *p, u32 speed) { (void)p; xmac_speed = (int)speed; }
+static void zx279133_switch_xmac_set_speed(struct zx279133_switch *p, u32 speed, bool do_reset) { (void)p; (void)do_reset; xmac_speed = (int)speed; }
 static int zx279133_switch_xpcs_read(struct zx279133_switch *p, int mmd, int reg) {
     (void)p; (void)mmd; (void)reg; return 0x1140;
 }
