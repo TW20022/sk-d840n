@@ -38,6 +38,7 @@ static const struct nla_policy zxpon_policy[ZXPON_A_MAX] = {
 	[ZXPON_A_OMCC] = { .type = NLA_U8 },
 	[ZXPON_A_KEY] = NLA_POLICY_EXACT_LEN(ZXPON_KEY_LEN),
 	[ZXPON_A_OMCI_FRAME] = NLA_POLICY_EXACT_LEN(ZXPON_OMCI_LEN),
+	[ZXPON_A_PLOAM_FRAME] = NLA_POLICY_EXACT_LEN(ZXPON_PLOAM_LEN),
 };
 
 static struct zxpon zx_state;
@@ -454,6 +455,45 @@ static int zxpon_omci_tx_cmd(struct sk_buff *skb, struct genl_info *info)
 	return zx279133_omci_send(netdev_priv(zx_wan), gem, frame, ZXPON_OMCI_LEN);
 }
 
+/*
+ * Rehearsal injection of a downstream PLOAM frame.
+ *
+ * With no fibre in the jack the receive loop never yields a frame, so the O2/O3
+ * -> O4 -> O5 half of the state machine cannot be exercised on the bench, and
+ * neither can anything that hangs off O5 (carrier, the data path, the OMCI
+ * channel).  This verb lets the bench feed the same 48 bytes the OLT would send
+ * and watch the board answer through the real hardware transmit path.
+ *
+ * It is a test hook, not a second protocol implementation: the MIC is
+ * recalculated here so a caller does not have to carry AES-CMAC of its own
+ * (tests/zxpon_test.c covers the CMAC itself), and everything downstream of
+ * zxpon_rx_ploam() is the ordinary code path.  Admin-only, like every other
+ * verb that can move the machine.
+ */
+static int zxpon_ploam_rx_cmd(struct sk_buff *skb, struct genl_info *info)
+{
+	static bool noted;
+	u8 frame[ZXPON_PLOAM_LEN];
+	int ret;
+
+	if (!info->attrs[ZXPON_A_PLOAM_FRAME])
+		return -EINVAL;
+	memcpy(frame, nla_data(info->attrs[ZXPON_A_PLOAM_FRAME]),
+	       ZXPON_PLOAM_LEN);
+	zxpon_ploam_seal(frame);
+	mutex_lock(&zx_pon_lock);
+	ret = zxpon_rx_ploam(&zx_state, frame);
+	mutex_unlock(&zx_pon_lock);
+	if (!noted) {
+		noted = true;
+		pr_info("zxpon: bench PLOAM injection in use; downstream frames now come from genl, not from the fibre\n");
+	}
+	if (ret < 0)
+		return -EBADMSG;
+	zxpon_apply_carrier();
+	return 0;
+}
+
 static const struct genl_ops zxpon_ops[] = {
 	{
 		.cmd = ZXPON_CMD_OMCI_TX,
@@ -495,6 +535,12 @@ static const struct genl_ops zxpon_ops[] = {
 		.flags = GENL_ADMIN_PERM,
 		.policy = zxpon_policy,
 		.doit = zxpon_set_key_cmd,
+	},
+	{
+		.cmd = ZXPON_CMD_PLOAM_RX,
+		.flags = GENL_ADMIN_PERM,
+		.policy = zxpon_policy,
+		.doit = zxpon_ploam_rx_cmd,
 	},
 };
 
