@@ -29,6 +29,7 @@ void *memcpy(void *destination, const void *source, size_t count) {
 #define PHY_INTERFACE_MODE_2500BASEX 3
 #define ZX279133_XMAC_SPEED_1G 3
 #define ZX279133_XMAC_SPEED_2P5G 6
+#define ZX279133_XMAC_SPEED_100 4
 #define ZX279133_SWITCH_OUTERPHY_SERDES_MODE_1G 2
 #define ZX279133_SWITCH_OUTERPHY_SERDES_MODE_2G5 0x16
 #define MDIO_MMD_VEND2 0x1f
@@ -151,11 +152,13 @@ int main(void) {
     CHECK(apply(SPEED_1000) == 0);
     CHECK(on_calls == 1 && off_calls == 0 && healthy());
     CHECK(xmac_speed == ZX279133_XMAC_SPEED_1G);
-    /* A 100M peer uses the SGMII lane path and the same owned reference. */
+    /* A 100M peer uses the SGMII lane path, the 100M speed code and the
+     * same owned reference.  The code matters: with the 1G code the MAC and
+     * the rate-adapting PHY disagree and no frame crosses (docs/112). */
     reset_state(); CHECK(apply(SPEED_100) == 0);
     CHECK(on_calls == 1 && off_calls == 0 && healthy());
     CHECK(selected_mode == PHY_INTERFACE_MODE_SGMII);
-    CHECK(xmac_speed == ZX279133_XMAC_SPEED_1G);
+    CHECK(xmac_speed == ZX279133_XMAC_SPEED_100);
     CHECK(sw.applied_outer_speed == SPEED_100);
     /* Repeated 1G/2.5G changes keep exactly one owned power/PM reference. */
     for (int i = 0; i < 100; ++i) {

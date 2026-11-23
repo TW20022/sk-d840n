@@ -144,6 +144,8 @@
  */
 #define ZX279133_XMAC_SPEED_1G		3
 #define ZX279133_XMAC_SPEED_2P5G	6
+#define ZX279133_XMAC_SPEED_100		4
+#define ZX279133_XMAC_SPEED_10		7
 #define ZX279133_XMAC_SPEED_USXGMII	0
 #define ZX279133_SYS_SOFT_RESET		0x2c0004
 #define ZX279133_XMAC0_RESET		BIT(10)
@@ -4187,16 +4189,28 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 			 "the 2.5G jack's PHY: system side at 2500 Mbps; programming the lane to match\n");
 	} else if (speed == SPEED_100) {
 		/*
-		 * The XMAC stays at the SGMII 1G code: the vendor's own
-		 * xmac_sgmii_conf() passes 3 to xamc_init_conf_by_speed()
-		 * whatever the copper side negotiated.  What has to change is
-		 * the lane's SR-MII control word, so the 1.25 Gbaud lane
-		 * carries a 100M code instead of a 1G one.
+		 * 100M has its own code in the MAC's speed field: 4.
+		 *
+		 * The rate the MAC tells the PHY over the SGMII code word is
+		 * what makes the PHY rate-adapt, so a MAC that keeps the 1G
+		 * code (3) on a 100M copper link neither accepts what the PHY
+		 * sends nor gets its own frames through: measured on the board
+		 * 2026-11-23, with the link up and the lane carrying code,
+		 * XMAC0 counted 28 good TX frames and the peer received none,
+		 * while the peer's own frames never reached the SoC.
+		 *
+		 * The scan that settled it, run at runtime on the armed lane by
+		 * writing TX_CTRL's speed field (bits 31:29) and pinging the
+		 * peer: codes 0, 1, 2, 3, 5 and 6 give no reply, 4 gives a
+		 * reply, and the peer's frames start arriving.  The vendor's
+		 * xmac_set_speed_sel() table says the same: 3 = 1G SGMII,
+		 * 4 = 100M, 6 = 2.5G, 7 = 10M.
 		 */
 		iface = PHY_INTERFACE_MODE_SGMII;
-		speed_code = ZX279133_XMAC_SPEED_1G;
+		speed_code = ZX279133_XMAC_SPEED_100;
 		dev_info(priv->dev,
-			 "the 2.5G jack's PHY: system side at 100M SGMII; the XMAC stays at the 1G SGMII code\n");
+			 "the 2.5G jack's PHY: system side at 100M SGMII; the XMAC takes the 100M code (%u)\n",
+			 speed_code);
 	} else {
 		iface = PHY_INTERFACE_MODE_SGMII;
 		speed_code = ZX279133_XMAC_SPEED_1G;
