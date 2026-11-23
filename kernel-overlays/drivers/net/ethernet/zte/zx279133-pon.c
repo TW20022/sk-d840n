@@ -2,9 +2,10 @@
 /*
  * XG-PON activation glue for the ZX279133 WAN netdev.
  *
- * The 49-word xgpon_nsyn image is still not programmed: the vendor modules
- * on hand have mode_xgpon_nsyn_cfg, not mode_xgpon_nsyn_cfg_133.  Everything
- * this file writes is named by a Hal_WriteXmacReg trace disassembled from
+ * The 49-word xgpon_nsyn image is programmed by phy-zx279133-pon-serdes.c
+ * from the bootloader's own mode-6 table; dumping 0x16000000..0x160000c0 on
+ * the board matches it word for word (docs/116).  Everything this file
+ * writes is named by a Hal_WriteXmacReg trace disassembled from
  * zte_xgpon.ko (4.19.136) and decoded in docs/106, and resolves against the
  * PON MAC block at 0x17000000 (see ZX_PON_MAC_PHYS): the vendor accessors are
  * fpga_read_reg(reg) / fpga_write_reg(reg), which index pon_base + reg * 4.
@@ -208,9 +209,16 @@ static inline void zx_xmac_rmw(u32 idx, u32 clear, u32 set)
 }
 
 /* The read-modify-write list below is fi_Configure_Hw_Init() plus
- * fi_Configure_Pon_Mode(7), transcribed from the AArch64 vendor module.
+ * fi_Configure_Pon_Mode(3), transcribed from the AArch64 vendor module.
  * No shared-PLL or SerDes register appears here: that side was brought up
  * separately in phy-zx279133-pon-serdes.c and is deliberately untouched.
+ *
+ * XG-PON is pon mode 3, not 7.  fi_Configure_Pon_Mode() branches on
+ * (mode & ~8) and the two branches differ in the mode nibble AND in the
+ * upstream burst preamble: 0x1688e is 0x20 with 0x3ff for XG-PON and 5
+ * with 0x3fe for XGS-PON.  The earlier transcription followed the
+ * g_up_mode == 0x80 branch, which is XGS, while this board's up_mode is
+ * 0x40 - the same module prints "pon mode is xg" on that path.  docs/116.
  */
 static void zx_pon_hw_bringup(void)
 {
@@ -219,30 +227,47 @@ static void zx_pon_hw_bringup(void)
 	if (!zx_pon_hw)
 		return;
 
-	/* XG-PON (mode 7): mode nibble, mode flag and the 0x3fe preamble. */
-	zx_xmac_rmw(0x6, 0xf, 7);
-	zx_xmac_w(0x1688e, 5);
-	val = (zx_xmac_r(0x1611d) & ~0x3ffu) | 0x3feu | 0xffc00u;
+	/* XG-PON (mode 3): mode nibble, preamble repeats, preamble pattern. */
+	zx_xmac_rmw(0x6, 0xf, 3);
+	zx_xmac_w(0x1688e, 0x20);
+	val = (zx_xmac_r(0x1611d) & ~0x3ffu) | 0x3ffu | 0xffc00u;
 	zx_xmac_w(0x1611d, val);
 
-	/* Top-level PON enable, held across vendor's 21-step delay loop. */
+	/* Top-level PON enable. Vendor writes this ONCE, then spins
+	 * 21 iterations of __const_udelay(0x418958) ~= 21ms waiting for
+	 * the internal init to complete before touching anything else.
+	 * (fi_Configure_Hw_Init @0x28fc disassembly; the old udelay(100)
+	 * was 200x too short and was misread as a 21x write loop.) */
 	zx_xmac_rmw(0x16000, 0, 0x1f);
-	udelay(100);
+	usleep_range(21000, 25000);
 	zx_xmac_rmw(0x1610b, 0, 0x80000);
 	/* Downstream disabled, but the two vendor config bits set. */
 	zx_xmac_rmw(0x16100, 0x1, 0x28);
-	/* Vendor writes byte0=2 then byte1=0x0f, then selects XGS and enables. */
-	val = (zx_xmac_r(0x16644) & ~0xffffu) | 0x1301u;
+	/* Vendor writes byte0=2 then byte1=0x0f here, which is exactly the
+	 * value this board's loader already leaves (0x0f02). */
+	val = (zx_xmac_r(0x16644) & ~0xffffu) | 0x0f02u;
 	zx_xmac_w(0x16644, val);
 	/* Upstream PLOAM path enabled, normal data upstream held off. */
 	zx_xmac_rmw(0x16600, 0x2 | 0x8, 0x11);
 	zx_xmac_rmw(0x1689f, 0, 0x1);
 	zx_xmac_rmw(0x1a, 0xc, 0);
 	zx_xmac_rmw(0x16001, 0, 0x1);
-	zx_xmac_rmw(0x16501, 0x2, 0x1);
+	/* Bytes are addressed explicitly by the vendor here: byte 2, not
+	 * byte 0 - set bit 16 and clear bit 17. */
+	zx_xmac_rmw(0x16501, 0x20000, 0x10000);
 	zx_xmac_rmw(0x16402, 0x3fff, 0x8);
 	zx_xmac_rmw(0x3000a, 0, 0x1);
 	zx_xmac_rmw(0x16635, 0, 0x1);
+
+	/* The tail of fi_Configure_Hw_Init(): the PON-mode word.  For
+	 * up_mode 0x40 byte1 is 0x1b and for 0x80 it is 0x13; byte0 is then
+	 * set to 1.  The old constant 0x1301 was the XGS word, and writing
+	 * an XGS PON-mode word to an XG-PON MAC is what took this board off
+	 * the bus in docs/107 - the board survives 0x1b01. */
+	val = (zx_xmac_r(0x16644) & ~0xff00u) | 0x1b00u;
+	zx_xmac_w(0x16644, val);
+	val = (zx_xmac_r(0x16644) & ~0xffu) | 0x1u;
+	zx_xmac_w(0x16644, val);
 }
 
 /* fi_Configure_Ponmac_Set_Sn(): two byte-swapped words at 0x16636/7. */

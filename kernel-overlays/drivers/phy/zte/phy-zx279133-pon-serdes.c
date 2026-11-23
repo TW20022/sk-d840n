@@ -2,6 +2,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
@@ -27,6 +28,26 @@
 #define ZX279133_PON_PLL_CFG0_FW_BIT		BIT(30)
 #define ZX279133_PON_PLL_CFG1_LATCH		BIT(28)
 #define ZX279133_PON_PLL_CFG1_ETH		0x04000000
+/*
+ * The two constants above are the vendor's own Ethernet branch: np_133.ko's
+ * pon_pll_cfg() takes the 0x20106454/0x04000000 pair (and PLL ref select 0)
+ * for modes 8..15, which are the 10G/5G/2.5G/1G BASE-R and BASE-X Ethernet
+ * images.  Its PON branch - modes 5..7, i.e. GPON and both XG-PON images - is
+ * a different pair with ref select 2:
+ *
+ *	mov w1, #0x2054 ; movk w1, #0x20   -> TOPCRM+0xc0 = 0x00202054
+ *	mov w1, #0x73e2 ; movk w1, #0x426  -> TOPCRM+0xc4 = 0x042673e2
+ *	and w1, w1, #0xffffffcf ; orr #0x20 -> +0x10 bits 5:4 = 2
+ *
+ * and it finishes by pulsing +0x0c bit 9 rather than leaving a mode field
+ * set.  Drawing 9.95328 GHz out of a PLL programmed for 10.3125 GHz is a
+ * 3.6% rate error, which is enough for the CDR to report lock while every
+ * 66-bit block the PCS sees is wrong.
+ */
+#define ZX279133_PON_PLL_CFG0_PON		0x00202054
+#define ZX279133_PON_PLL_CFG1_PON		0x042673e2
+#define ZX279133_PON_PLL_REF_SEL_PON		2
+#define ZX279133_TOPCRM_PON_PLL_LOAD		BIT(9)
 
 #define ZX279133_PON_SERDES_ACTIVATE0		0x40
 #define ZX279133_PON_SERDES_ACTIVATE0_EN	BIT(15)
@@ -50,6 +71,33 @@
 #define ZX279133_PON_SERDES_RX_STATUS		0xe4
 #define ZX279133_PON_SERDES_RX_LOS		BIT(0)
 #define ZX279133_PON_SERDES_CDR_LOCK		BIT(1)
+
+/*
+ * AN1 PLL: the PON reference clock.  np_133.ko's pon_serdes_init() calls
+ * an1_pll_clk_set(6) -> an1_pll_gpon_cfg() *before* serdes_mode_set() writes
+ * the 49-word lane image.  The two DTS nodes (pon_serdes@16000000 and
+ * pon_serdes_pll@16010000) are 64K apart but A[16] is not decoded on this
+ * SoC, so they alias: the vendor writes the PLL recipe first, latches it,
+ * then lets the lane image overwrite words 0..7.  The PLL keeps its
+ * configuration internally.
+ *
+ * an1_pll_gpon_cfg() differs from the Ethernet AN1 setup in exactly two
+ * places: +0x08 0x01050700 (not ...707) and +0x1c 0x00130000 (not
+ * 0x00130200).  Those select the 155.52 MHz PON reference instead of the
+ * 156.25 MHz Ethernet one.  Without it the CDR locks to the 9.95328G line
+ * but the PCS deskew runs on a 3.6%-wrong parallel clock: XPCS1 never gets
+ * block lock, the XMAC sits in LOF (0x16105 = 0x10) and rx stays at zero.
+ */
+#define ZX279133_AN1_PLL_STATUS			0x20
+#define ZX279133_AN1_PLL_LOCK			BIT(0)
+#define ZX279133_AN1_PLL_LATCH			BIT(0)
+#define ZX279133_AN1_PLL_POLL_US		1000
+#define ZX279133_AN1_PLL_LOCK_TIMEOUT_US	200000
+
+static const u32 zx279133_an1_pll_gpon_cfg[8] = {
+	0x2af8c074, 0x447424a0, 0x01050700, 0x00000107,
+	0x00003100, 0x4000003a, 0x00000002, 0x00130000,
+};
 
 #define ZX279133_PON_SERDES_RESET_US		10000
 #define ZX279133_PON_SERDES_PROFILE_WORDS	49
@@ -179,6 +227,44 @@ static const char *zx279133_pon_serdes_mode_name(struct zx279133_pon_serdes *pri
 	}
 }
 
+/*
+ * Rebuild the AN1 PLL PON reference after the SerDes resets.  U-Boot already
+ * did this once, but our reset_control_bulk_assert/deassert clears it, and
+ * writing only the 49-word lane image leaves the PCS on the Ethernet
+ * 156.25 MHz reference.  This is the one step our power_on() was missing.
+ *
+ * The vendor treats a missing lock as non-fatal (it only printk's), so do
+ * the same: a timeout must not prevent the lane image from being loaded.
+ */
+static void zx279133_pon_serdes_configure_an1_pll(
+	struct zx279133_pon_serdes *priv)
+{
+	u32 val;
+	int i, ret;
+
+	if (!priv->xgpon)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(zx279133_an1_pll_gpon_cfg); i++)
+		writel(zx279133_an1_pll_gpon_cfg[i],
+		       priv->pll + i * sizeof(u32));
+
+	/* an1_pll_gpon_cfg() writes 0x00003100 then sets bit0 of +0x10. */
+	val = readl(priv->pll + 0x10);
+	writel(val | ZX279133_AN1_PLL_LATCH, priv->pll + 0x10);
+
+	ret = readl_poll_timeout(priv->pll + ZX279133_AN1_PLL_STATUS,
+				 val, val & ZX279133_AN1_PLL_LOCK,
+				 ZX279133_AN1_PLL_POLL_US,
+				 ZX279133_AN1_PLL_LOCK_TIMEOUT_US);
+	if (ret)
+		dev_warn(priv->dev,
+			 "AN1 PLL (155.52M PON ref) no lock, status %#x\n", val);
+	else
+		dev_info(priv->dev,
+			 "AN1 PLL locked on 155.52M PON ref, status %#x\n", val);
+}
+
 static void zx279133_pon_serdes_write_profile(struct zx279133_pon_serdes *priv,
 					      const u32 *profile, size_t count)
 {
@@ -210,7 +296,7 @@ static void zx279133_pon_serdes_write_profile(struct zx279133_pon_serdes *priv,
 
 static int zx279133_pon_serdes_configure_pll(struct zx279133_pon_serdes *priv)
 {
-	u32 val;
+	u32 cfg0, cfg1, val;
 	int ret;
 
 	ret = regmap_read(priv->topcrm, ZX279133_TOPCRM_PON_MUX_CTRL,
@@ -228,6 +314,45 @@ static int zx279133_pon_serdes_configure_pll(struct zx279133_pon_serdes *priv)
 	priv->saved_pll_cfg1 =
 		readl(priv->topcrm_mode + ZX279133_PON_PLL_CFG1);
 	priv->configured = true;
+
+	if (priv->xgpon) {
+		/*
+		 * XG-PON wants the PON branch of the vendor's table, not the
+		 * Ethernet one: 9.95328 GHz comes out of 0x00202054/0x042673e2
+		 * with the PON reference selected, and the PLL is reloaded by a
+		 * pulse on +0x0c bit 9 instead of a static mode field.
+		 */
+		cfg0 = ZX279133_PON_PLL_CFG0_PON;
+		cfg1 = ZX279133_PON_PLL_CFG1_PON;
+		ret = regmap_update_bits(priv->topcrm,
+					 ZX279133_TOPCRM_PON_PLL_SEL,
+					 ZX279133_TOPCRM_PON_PLL_SEL_MASK,
+					 ZX279133_PON_PLL_REF_SEL_PON << 4);
+		if (ret)
+			return ret;
+
+		writel(readl(priv->topcrm_mode + ZX279133_PON_PLL_CFG1) |
+		       ZX279133_PON_PLL_CFG1_LATCH,
+		       priv->topcrm_mode + ZX279133_PON_PLL_CFG1);
+		writel(cfg0, priv->topcrm_mode + ZX279133_PON_PLL_CFG0);
+		writel(cfg1, priv->topcrm_mode + ZX279133_PON_PLL_CFG1);
+
+		ret = regmap_update_bits(priv->topcrm,
+					 ZX279133_TOPCRM_PON_MUX_CTRL,
+					 ZX279133_TOPCRM_PON_MODE_MASK, 0);
+		if (ret)
+			return ret;
+		ret = regmap_update_bits(priv->topcrm,
+					 ZX279133_TOPCRM_PON_MUX_CTRL,
+					 ZX279133_TOPCRM_PON_PLL_LOAD,
+					 ZX279133_TOPCRM_PON_PLL_LOAD);
+		if (ret)
+			return ret;
+		udelay(2);
+		return regmap_update_bits(priv->topcrm,
+					  ZX279133_TOPCRM_PON_MUX_CTRL,
+					  ZX279133_TOPCRM_PON_PLL_LOAD, 0);
+	}
 
 	ret = regmap_update_bits(priv->topcrm, ZX279133_TOPCRM_PON_PLL_SEL,
 				 ZX279133_TOPCRM_PON_PLL_SEL_MASK, 0);
@@ -337,12 +462,41 @@ static int zx279133_pon_serdes_power_on(struct phy *phy)
 	if (ret)
 		goto err_disable_clk;
 
-	ret = zx279133_pon_serdes_reset(priv);
-	if (ret)
-		goto err_disable_clk;
+	dev_info(priv->dev,
+		 "PON PLL %s: cfg0 %#x -> %#x, cfg1 %#x -> %#x, mux %#x\n",
+		 priv->xgpon ? "PON branch" : "Ethernet branch",
+		 priv->saved_pll_cfg0,
+		 readl(priv->topcrm_mode + ZX279133_PON_PLL_CFG0),
+		 priv->saved_pll_cfg1,
+		 readl(priv->topcrm_mode + ZX279133_PON_PLL_CFG1),
+		 priv->saved_mux);
 
-	zx279133_pon_serdes_write_profile(priv, profile,
-					  ZX279133_PON_SERDES_PROFILE_WORDS);
+	if (priv->xgpon) {
+		/*
+		 * U-Boot already ran the full pon_serdes_init() for this board
+		 * and logged "enter gpon pon pll cfg" -> mode_xgpon_nsyn_cfg_133
+		 * -> com_pll_lock_ready -> "rx los =0 rx data in" ->
+		 * cdr_lock_ready -> "pon serdes init succeed".  That sequence
+		 * also owns the AN1 PON reference, the XPCS1 10GBASE-R setup
+		 * and the XMAC1 FIFO/clock gates, none of which this driver
+		 * has a recipe for.  Asserting the SerDes resets on every Linux
+		 * boot wipes all of it; reloading only the 49-word lane image
+		 * (even with the AN1 PLL recipe added) left the framer in LOF
+		 * (0x16105=0x10), superframe counter frozen and rx=0.  Keep the
+		 * bootloader's known-good state and only verify the lane is
+		 * alive with the read-only polls below.
+		 */
+		dev_info(priv->dev,
+			 "XG-PON: preserving U-Boot SerDes state (no reset/reload)\n");
+	} else {
+		ret = zx279133_pon_serdes_reset(priv);
+		if (ret)
+			goto err_disable_clk;
+
+		zx279133_pon_serdes_configure_an1_pll(priv);
+		zx279133_pon_serdes_write_profile(priv, profile,
+			ZX279133_PON_SERDES_PROFILE_WORDS);
+	}
 
 	ret = readl_poll_timeout(priv->serdes + ZX279133_PON_SERDES_PLL_STATUS,
 				 val, val & ZX279133_PON_SERDES_PLL_LOCK,
