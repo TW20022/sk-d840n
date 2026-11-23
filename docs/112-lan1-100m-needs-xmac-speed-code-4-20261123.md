@@ -27,6 +27,9 @@ MAC 按 1G 收发 —— 两个方向都收不到合法帧。
 表现出来就是：链路 up、`carrier=1`、`speed=100`、`lane carries code`、
 SOPC 已发布，**但双向零帧**。
 
+改完之后整机五个电口全部验证通过（LAN1 100M/2G/2.5G，LAN2/3/4 100M/1G），
+见文末「整机端口矩阵验收」。
+
 ## 决定性测量（2026-11-23，板上运行期）
 
 速率码是 `TX_CTRL` 的 bit31:29，可以直接用 `wrreg` 在运行期改，所以不必重编内核
@@ -120,6 +123,29 @@ the 2.5G jack: lane programmed for 100M SGMII (XMAC speed 4)
 - 配置持久化（重启后读）：`pon.pon.serial_number=CMDCA133E348`、
   `network.wan.proto=pppoe / device=eth0.99 / disabled=1`；`pppd` 未启动、
   `pon_state=O1`（无光，符合预期）。
+
+## 整机端口矩阵验收（2026-11-23 15:15，板上实测）
+
+速率码改成 4 之后，整机五个口逐个过了一遍，全部通：
+
+| 端口 | 物理 | 实测速率档 | 走的分支 |
+|---|---|---|---|
+| LAN1 | RTL8226 2.5G jack（DSA portname `p8`，outerphy port 5） | 100M / 2G / 2.5G | 码 4 / 码 6（2500BASEX） |
+| LAN2 | 千兆 | 100M / 1000M | switch 内部 GMAC，不经 outerphy |
+| LAN3 | 千兆 | 100M / 1000M | 同上 |
+| LAN4 | 千兆 | 100M / 1000M | 同上 |
+
+这张表的意义在于**回归面**：LAN1 的三个速率档在代码里是三条互斥分支
+（`SPEED_2500 → 2500BASEX + 码 6`、`SPEED_100 → SGMII + 码 4`、其余 → `SGMII + 码 3`
+且 `speed` 归一到 1000），改 100M 那一条不会碰到另外两条。实测与分支结构一致，
+所以这不是"碰巧通"，是改在了正确的那一格里。
+
+LAN2/3/4 走的是 switch 自己的 GMAC、根本不经过 outerphy 和 XMAC0，因此
+docs/111 与 docs/112 两处改动对它们没有任何影响 —— 实测也确认了这一点。
+
+注：LAN1 的 **1000M 档**本轮没有单独重测（对端一直在 100M 和 2.5G 两档之间切）。
+它走的是码 3，也就是厂商 `xmac_set_speed_sel()` 表里 1G SGMII 的原生码，
+历史上 lan1 接 1G 对端是通的（docs/92 §96.44），不是这次改动引入的路径。
 
 ## 一个容易再犯的坑
 
