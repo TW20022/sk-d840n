@@ -66,6 +66,40 @@ code=6 txctrl=0xc0010001 replies=0 rx=9
 4. PC 通过 lan1 DHCP 拿到 192.168.9.150，`ping 192.168.9.1` 通；
 5. 回归：1G 对端仍走码 3，2.5G 仍走码 6，LAN2/3/4 不受影响。
 
+## 启动态验证（2026-11-23 12:23，刷入后重启）
+
+```
+[    9.365] the 2.5G jack's PHY: system side at 100M SGMII; the XMAC takes the 100M code (4)
+[    9.418] the 2.5G jack: lane programmed for 100M SGMII (BMCR 0x1140)
+[    9.418] the 2.5G jack: lane programmed for 100M SGMII (XMAC speed 4)
+
+rdreg 0x19140000  ->  0x80010001          # bit31:29 = 4
+carrier / speed   ->  1 / 100
+```
+
+结果：
+
+| 项 | 实测 |
+|---|---|
+| `ping 192.168.9.150`（PC 主动） | 4/4，0.57 ms |
+| `ping`（设备主动） | 5/5，`lan1 rx` 持续增长 |
+| 1448 字节大包 | 10/10，0% 丢包 |
+| TCP 下载 7.55 MB（PC→设备） | 0.74 s ≈ **82 Mbps 载荷**（约 87% 线速） |
+| DHCP | `DHCPREQUEST(br-lan) 192.168.9.150` / `DHCPACK … CQ45`，租约落盘 |
+| lan1 down/up 翻转 | 重新 up 100M，速率码保持 4，ping 继续通 |
+
+`lan1 down/up` 之后没有第二次复位脉冲（`applied_outer_speed` 未变，速率跟随逻辑去重），
+所以"再次脉冲把已 armed 的 MAC 拆掉"那条老坑在这条路径上不会被触发；只有 PCS 被
+外部复位、lane watcher 走恢复分支时才会重新脉冲。
+
+## 留给下一次的两件事
+
+1. **10M 对端未验证**。厂商表里 7 = 10M，但运行期扫描时码 7 在 100M 对端上也能通，
+   说明该字段的编码还没完全弄清；`SPEED_10` 目前仍落进 "其它" 分支按 1G 处理，
+   接 10M 对端大概率同样不通。真要支持再单独测。
+2. **`XMAC0 reset pulsed` 与 `SOPC send-enable` 是 100M 的必要条件**（docs/111），
+   本次没有改动这条握手，只在它之后补上了正确的速率码。
+
 ## 与 docs/111 的关系
 
 111 修的是"ready 被日志读掉"，那一步让 SOPC 发布成功、`never became ready`
