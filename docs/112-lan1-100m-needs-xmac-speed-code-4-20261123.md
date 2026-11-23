@@ -92,6 +92,43 @@ carrier / speed   ->  1 / 100
 所以"再次脉冲把已 armed 的 MAC 拆掉"那条老坑在这条路径上不会被触发；只有 PCS 被
 外部复位、lane watcher 走恢复分支时才会重新脉冲。
 
+## 正式产物刷入验证（2026-11-23 13:35，CI run 19）
+
+前面几轮验证用的是本地编译内核（与 CI 同源、未压缩 Image 逐字节同尺寸）。最后
+把 CI run 19（`662c66c`，含 `da2cfb7` 速率码 + `662c66c` 日志）的正式产物刷进去
+再验一遍，留档。
+
+- 产物：`skd840n_flash_19_45110801012`，`flash-uImage` 7267774 B，
+  sha256 `6b0ed3080caf452105b321d1edca294982fa7c6600f6561aaebaa33d28d2ade3`；
+  `flash-dtb.bin` 13886 B，`e68949b7…`。
+- 刷法：PC 起 `http.server`，设备 `wget` 到 `/tmp` 后 **sha256 比对一致**，
+  `mtd write … kernel`，回读前 7267774 B 再比一次，两次都对。
+- 启动态（dmesg）：
+
+```
+the 2.5G jack: XMAC0 reset pulsed for the 100M peer (reset word 0xffffffff)
+SOPC mac 1 never became ready (0x00000000); not publishing it
+the 2.5G jack: lane programmed for 100M SGMII (BMCR 0x1140)
+the 2.5G jack: lane programmed for 100M SGMII (XMAC speed 4)
+```
+
+  mac 0 的 `never became ready` 不再出现（只剩从来不用通道的 mac 1）；
+  `rdreg 0x19140000` = `0x80010001`；carrier=1、speed=100。
+- 数据面：ICMP 5/5 零丢（RTT 0.94 ms）、1400 B 大包 5/5、TCP 7.27 MB / 0.83 s
+  ≈ 70 Mbps、`lan1 rx 5246 / tx 2717` 持续增长；PC 侧 `PrefixOrigin=Dhcp`
+  持 192.168.9.150。
+- 配置持久化（重启后读）：`pon.pon.serial_number=CMDCA133E348`、
+  `network.wan.proto=pppoe / device=eth0.99 / disabled=1`；`pppd` 未启动、
+  `pon_state=O1`（无光，符合预期）。
+
+## 一个容易再犯的坑
+
+`lane *_snapshot` 诊断里那段 `SOPC mac %d ready=0x%08x` 也是**消耗性读**
+（`nppt+0x342a4 + 4*i`）。当前调用顺序是"快照在前、脉冲在后、publish 在最后"，
+所以不影响；但任何把快照插到「脉冲」与 `sopc_publish()` 之间的改动，都会
+原样重现 docs/111 那个 bug —— ready 被打印读掉，publish 读到 0。改这段路径前
+先看这条。
+
 ## 留给下一次的两件事
 
 1. **10M 对端未验证**。厂商表里 7 = 10M，但运行期扫描时码 7 在 100M 对端上也能通，
