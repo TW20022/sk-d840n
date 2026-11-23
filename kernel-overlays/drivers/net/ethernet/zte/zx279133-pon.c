@@ -165,7 +165,7 @@ struct zx_gem_row {
 
 
 static void __iomem *zx_pon_hw;
-static u32 zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_txerr_n;
+static u32 zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_txerr_n, zx_ploam_busy_n;
 static u8 zx_last_rx_id;
 static int zx_hw_data_on;
 
@@ -293,7 +293,16 @@ static int zx_pon_hw_ploam_rx(u8 frame[ZXPON_PLOAM_LEN])
 	return 1;
 }
 
-/* fi_Configure_Ponmac_Send_Ploam_Msg(): wait, 12 words, kick, wait. */
+/*
+ * fi_Configure_Ponmac_Send_Ploam_Msg(): wait, 12 words, kick, wait.
+ *
+ * The vendor carries on and writes the frame even if the window never frees
+ * up.  On this board that happens for a real reason - with no OLT there is no
+ * upstream grant, so the window stays busy indefinitely - and re-writing the
+ * same 12 words every 100 ms only churns registers and hides the state.  So a
+ * window that is still busy is reported as -EBUSY and the queued frame stays
+ * where it is, to be retried on a later tick.
+ */
 static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 {
 	int i, ok = 0;
@@ -302,6 +311,8 @@ static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1))
 			break;
 	}
+	if (i == 16)
+		return -EBUSY;
 	for (i = 0; i < ZXPON_PLOAM_LEN / 4; i++) {
 		u32 word;
 
@@ -623,10 +634,17 @@ static void zxpon_poll_ploam(void)
 		zxpon_rx_ploam(&zx_state, frame);
 	}
 	for (i = 0; i < 4; i++) {
+		int ret;
+
 		if (!zxpon_peek_ploam(&zx_state, frame))
 			break;
-		if (zx_pon_hw_ploam_tx(frame)) {
-			zx_ploam_txerr_n++;
+		ret = zx_pon_hw_ploam_tx(frame);
+		if (ret) {
+			/* -EBUSY with no fibre is the normal state, not a fault. */
+			if (ret == -EBUSY)
+				zx_ploam_busy_n++;
+			else
+				zx_ploam_txerr_n++;
 			break;
 		}
 		zxpon_take_ploam(&zx_state, frame);
@@ -722,11 +740,11 @@ static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
 	mutex_unlock(&zx_pon_lock);
 	return sysfs_emit(buf,
 		"mapped=%u rx_pending=%08x tx_kick=%08x "
-		"rx=%u tx=%u txerr=%u last_rx_id=%02x data=%u "
+		"rx=%u tx=%u txerr=%u busy=%u last_rx_id=%02x data=%u "
 		"alloc=%04x alloc_valid=%u\n",
 		zx_pon_hw ? 1 : 0, zx_xmac_r(ZX_PON_RX_PENDING),
 		zx_xmac_r(ZX_PON_TX_KICK), zx_ploam_rx_n, zx_ploam_tx_n,
-		zx_ploam_txerr_n, zx_last_rx_id, zx_hw_data_on,
+		zx_ploam_txerr_n, zx_ploam_busy_n, zx_last_rx_id, zx_hw_data_on,
 		alloc, alloc_ok);
 }
 static DEVICE_ATTR_RO(pon_hw);

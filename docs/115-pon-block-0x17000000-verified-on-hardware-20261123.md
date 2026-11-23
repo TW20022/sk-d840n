@@ -158,6 +158,27 @@ than a one-shot done pulse. `zx_gem_table_wait()` polls it for nonzero exactly
 as the vendor does; on this silicon that check returns immediately, which is
 why the read data has to be judged on its own.
 
+## The upstream PLOAM path really transmits
+
+With the block armed, the tick's serial-number retry reaches the wire. On a
+fresh boot, `echo on > pon_arm` and then:
+
+```
+tx=6   txerr=0 busy=0 tx_kick=00000000   (6 s in)
+tx=10  txerr=1 busy=1 tx_kick=00000001   (11 s in)
+```
+
+Ten frames are accepted by the MAC, then the window stays busy because there
+is no OLT to grant an upstream slot. That is the expected steady state without
+fibre, and it is the first time this driver has put a frame into the real PON
+block.
+
+The send helper now reports `-EBUSY` when the window never frees up instead of
+writing the 12 words anyway, which is what the vendor does. Without that, the
+tick rewrote the same frame every 100 ms: an earlier run logged `txerr=560` in
+a couple of minutes, all of it register churn that hid the real state. `pon_hw`
+shows `busy=` separately so "no grant" is not confused with a fault.
+
 ## Driver changes
 
 `kernel-overlays/drivers/net/ethernet/zte/zx279133-pon.c`
