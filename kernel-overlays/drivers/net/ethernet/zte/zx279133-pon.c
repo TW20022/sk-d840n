@@ -11,11 +11,12 @@
  *
  * The software activation state machine used to have no hardware layer at
  * all: it could walk to O2-3 in memory while the PON MAC registers were all
- * zero.  The hardware side is now real, but it is armed on request rather than
- * at probe: the PON block's clocks are off in this tree and touching it first
- * stalls the SoC bus, so pon_arm_store() opens the topcrm gates, maps the block
- * and runs the bring-up, and the 100 ms tick only does PLOAM RX/TX once that
- * has happened.
+ * zero.  The hardware side is armed on request rather than at probe, because
+ * the first attempt to drive it took the board off the bus: the block's clocks
+ * are already on (the NPPT driver enables all six), so the failure was the
+ * transmit side running before the IDM rings were set up.  pon_arm_store()
+ * therefore has a read-only stage and a bring-up stage, and the 100 ms tick
+ * only touches PLOAM RX/TX once the block has been armed at all.
  *
  * The management channel is closed here too: downstream OMCI frames enter
  * zxpon_rx_omci(), whose replies are drained into the IDM queue 0 by the same
@@ -30,14 +31,20 @@
 
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
 #include <linux/if_arp.h>
 #include <linux/io.h>
+#include <linux/clk.h>
 #include <linux/leds.h>
+#include <linux/ioport.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/swab.h>
 #include <net/genetlink.h>
 #include <net/netlink.h>
+
+#include <linux/stdarg.h>
 
 #include "zx279133.h"
 #include "zxpon.h"
@@ -156,17 +163,6 @@ struct zx_gem_row {
 #define ZX_PON_MAC_PHYS		0x17000000
 #define ZX_PON_MAC_SIZE		0x1000000
 
-/*
- * The PON block stays unclocked until topcrm is told otherwise, and an access
- * to an unclocked block stalls the AXI bus hard enough that only a reset gets
- * the SoC back.  These are the five gates the mainline clock driver registers
- * with CLK_IGNORE_UNUSED but never turns on: pon_idm_aclk (0), pon_tm_aclk (1),
- * pon_pclk (2), pon_smac_wclk (7), pon_mac_wclk (12).
- */
-#define ZX_TOPCRM_PHYS		0x10e10000
-#define ZX_TOPCRM_SIZE		0x10000
-#define ZX_TOPCRM_PON_GATE	0x48
-#define ZX_PON_GATE_BITS	0x1087
 
 static void __iomem *zx_pon_hw;
 static u32 zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_txerr_n;
@@ -816,40 +812,97 @@ static DEVICE_ATTR_RO(pon_tables);
  */
 /*
  * Arming the PON block is deliberately a userspace action, not something probe
- * does.  Booting must not depend on a block that hangs the bus when its clocks
- * are off: the board comes up with the driver in "no hardware" mode, and
- * /sys/class/net/eth0/pon_arm is what maps 0x17000000, opens the topcrm gates
- * and runs the vendor bring-up.  Run it with /dev/watchdog0 armed (see
- * pon_revive/pon_arm.py) and a stall costs a 20 s reset instead of a power
- * cycle.
+ * does.  Booting must not depend on a block that once took the board off the
+ * bus: the board comes up with the driver in "no hardware" mode, and
+ * /sys/class/net/eth0/pon_arm is what maps 0x17000000.  Plain "on" is
+ * read-only - it maps, reports the state the bootloader left behind, and lets
+ * the tick poll.  Only "force" writes the vendor init, which is not needed on
+ * this board and is kept for bench work.  Keep pon_revive/uboot_kernel_recover.py
+ * and the TFTP image ready when experimenting; a stall there costs a power
+ * cycle, not a brick, because boot never touches this block.
  */
-static u32 zx_topcrm_pon_gate_before;
 static bool zx_pon_armed;
+
+/*
+ * Arming is staged, and the first stage only reads.
+ *
+ * The block does answer plain MMIO: the NPPT driver writes pon_route
+ * (0x17000080) through a regmap on every boot, and the six PON clocks are
+ * already running because zx279133-main.c calls clk_bulk_prepare_enable() on
+ * them.  What took the board down in the first attempt was therefore not a
+ * missing clock - it was the vendor bring-up driving the MAC transmit side
+ * before the IDM rings existed.  So:
+ *
+ *   echo map > pon_arm    map the window, list the clock rates, read 5 words
+ *   echo on  > pon_arm    map (if needed), then run the vendor bring-up
+ *
+ * Every read is bracketed by two pr_emerg() lines, so a stall on the serial
+ * console names the exact register that did it instead of leaving a blank
+ * screen.
+ */
+static void zx_pon_read(u32 idx)
+{
+	pr_emerg("zxpon: read %05x ...\n", idx);
+	pr_emerg("zxpon: read %05x = %08x\n", idx, zx_xmac_r(idx));
+}
 
 static ssize_t pon_arm_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
-	void __iomem *topcrm;
-	u32 now;
+	struct net_device *ndev = to_net_dev(dev);
+	struct zx279133_eth *eth = netdev_priv(ndev);
+	bool do_on;
+	int i;
 
-	if (zx_pon_armed)
+	if (sysfs_streq(buf, "force"))
+		do_on = true;
+	else if (sysfs_streq(buf, "on") || sysfs_streq(buf, "1") ||
+		 sysfs_streq(buf, "map"))
+		do_on = false;
+	else
+		return -EINVAL;
+
+	if (!zx_pon_hw) {
+		phys_addr_t phys = ZX_PON_MAC_PHYS;
+
+		for (i = 0; i < ZX279133_NUM_CLOCKS; i++) {
+			struct clk *clk = eth->clocks[i].clk;
+
+			pr_emerg("zxpon: clk %s %s %lu Hz\n",
+				 eth->clocks[i].id, clk ? "on" : "ABSENT",
+				 clk ? clk_get_rate(clk) : 0UL);
+		}
+
+		if (!request_mem_region(phys, ZX_PON_MAC_SIZE, "zxpon-pon-mac"))
+			pr_warn("zxpon: %pa is claimed elsewhere, mapping anyway\n",
+				&phys);
+		zx_pon_hw = devm_ioremap(dev, phys, ZX_PON_MAC_SIZE);
+		if (!zx_pon_hw)
+			return -ENOMEM;
+		pr_emerg("zxpon: mapped %pa size %x\n", &phys, ZX_PON_MAC_SIZE);
+		zx_pon_armed = true;
+	}
+
+	/* Read-only first: the words the vendor's own poll touches. */
+	zx_pon_read(0x16000);
+	zx_pon_read(0x16001);
+	zx_pon_read(0x16048);
+	zx_pon_read(0x16100);
+	zx_pon_read(0x16147);
+
+	if (!do_on)
 		return count;
 
-	topcrm = devm_ioremap(dev, ZX_TOPCRM_PHYS, ZX_TOPCRM_SIZE);
-	if (!topcrm)
-		return -ENOMEM;
-	zx_topcrm_pon_gate_before = readl(topcrm + ZX_TOPCRM_PON_GATE);
-	writel(zx_topcrm_pon_gate_before | ZX_PON_GATE_BITS,
-	       topcrm + ZX_TOPCRM_PON_GATE);
-	now = readl(topcrm + ZX_TOPCRM_PON_GATE);
-	dev_info(dev, "topcrm pon gate %08x -> %08x\n",
-		 zx_topcrm_pon_gate_before, now);
-
-	zx_pon_hw = devm_ioremap(dev, ZX_PON_MAC_PHYS, ZX_PON_MAC_SIZE);
-	if (!zx_pon_hw)
-		return -ENOMEM;
+	/*
+	 * Only on an explicit "force".  The board's own bootloader already
+	 * programs this MAC: 0x16644 reads 0x0f02, 0x16635 has its enable bit,
+	 * 0x1611d is 0x000fffff, and 0x166c2 still holds the serial-number
+	 * PLOAM it queued (0x03ff 0100...).  Re-running the init on top of that
+	 * would overwrite the mode word - 0x16644 low half is 0x0f02, while the
+	 * bring-up writes 0x1301 - so it stays behind a verb of its own.
+	 */
+	pr_emerg("zxpon: running vendor bring-up (force)\n");
 	zx_pon_hw_bringup();
-	zx_pon_armed = true;
 	return count;
 }
 static DEVICE_ATTR_WO(pon_arm);
@@ -858,43 +911,141 @@ static ssize_t pon_probe_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
 	ssize_t len = 0;
-	u32 before, after, restored, pattern = 0x00c30001;
+	u32 mode, gem_word = 0;
+	u16 gem = 1348;
 
-	len += sysfs_emit_at(buf, len, "armed=%u gate_before=%08x gate_bits=%04x\n",
-			     zx_pon_armed, zx_topcrm_pon_gate_before,
-			     ZX_PON_GATE_BITS);
+	len += sysfs_emit_at(buf, len, "armed=%u mapped=%u\n",
+			     zx_pon_armed, zx_pon_hw ? 1 : 0);
 	if (!zx_pon_hw)
 		return len + sysfs_emit_at(buf, len, "no-mmio\n");
 
 	/*
-	 * One write-read cycle on the T-CONT bank proves the block answers: it
-	 * is a plain read/write word, and the vendor reads it before writing.
-	 * The original value goes straight back.
+	 * Read-only on purpose.  The first attempt to poke this block took the
+	 * board off the bus, so the diag attribute must never write a register:
+	 * it reports what the wire says right now.
 	 */
-	before = zx_xmac_r(ZX_TCONT_BANK);
-	zx_xmac_w(ZX_TCONT_BANK, pattern);
-	after = zx_xmac_r(ZX_TCONT_BANK);
-	zx_xmac_w(ZX_TCONT_BANK, before);
-	restored = zx_xmac_r(ZX_TCONT_BANK);
+	mode = zx_xmac_r(0x16644);
+	if (zxpon_omcc_gem(&zx_state, &gem) && gem <= 0xfffe) {
+		zx_xmac_w(ZX_GEM_TABLE_ADDR, gem | ZX_GEM_TABLE_READ);
+		gem_word = zx_xmac_r(ZX_GEM_TABLE_DATA);
+	}
 	len += sysfs_emit_at(buf, len,
-		"tcont bank: before=%08x wrote=%08x read=%08x %s restored=%08x\n",
-		before, pattern, after, after == pattern ? "MATCH" : "no", restored);
-
+		"16644=%08x mode=%u 16635=%08x 16100=%08x 16000=%08x 16001=%08x\n",
+		mode, mode & 0xf, zx_xmac_r(0x16635), zx_xmac_r(0x16100),
+		zx_xmac_r(0x16000), zx_xmac_r(0x16001));
 	len += sysfs_emit_at(buf, len,
-		"16000=%08x 16001=%08x 16100=%08x 1610b=%08x 1611d=%08x 16147=%08x\n",
-		zx_xmac_r(0x16000), zx_xmac_r(0x16001), zx_xmac_r(0x16100),
-		zx_xmac_r(0x1610b), zx_xmac_r(0x1611d), zx_xmac_r(0x16147));
+		"tcont0=%08x ploam_tx_kick=%08x rx_pending=%08x gem%u=%02x\n",
+		zx_xmac_r(ZX_TCONT_BANK), zx_xmac_r(ZX_PON_TX_KICK),
+		zx_xmac_r(ZX_PON_RX_PENDING), gem, gem_word);
 	len += sysfs_emit_at(buf, len,
-		"16205=%08x 16206=%08x 16207=%08x 16600=%08x 16601=%08x\n",
-		zx_xmac_r(0x16205), zx_xmac_r(0x16206), zx_xmac_r(0x16207),
-		zx_xmac_r(0x16600), zx_xmac_r(0x16601));
-	len += sysfs_emit_at(buf, len,
-		"16636=%08x 16637=%08x 16642=%08x 16644=%08x 3000a=%08x\n",
-		zx_xmac_r(0x16636), zx_xmac_r(0x16637), zx_xmac_r(0x16642),
-		zx_xmac_r(0x16644), zx_xmac_r(0x3000a));
+		"1611d=%08x 1610b=%08x 16206=%08x 1688e=%08x 16600=%08x\n",
+		zx_xmac_r(0x1611d), zx_xmac_r(0x1610b), zx_xmac_r(0x16206),
+		zx_xmac_r(0x1688e), zx_xmac_r(0x16600));
 	return len;
 }
 static DEVICE_ATTR_RO(pon_probe);
+
+/*
+ * Bench register access for the PON block.
+ *
+ * Bringing this block up cannot be done blind: the first attempt to drive it
+ * took the whole board off the bus, and the vendor's init is a 60-step
+ * sequence whose effect on each status register is unknown here.  So instead
+ * of a monolithic bring-up, this attribute lets the bench do one thing at a
+ * time and look at the answer:
+ *
+ *   echo "r 16100"          > pon_reg    read one register
+ *   echo "w 16100 28"       > pon_reg    write one register
+ *   echo "m 16100 0 1"      > pon_reg    read-modify-write (clear, set)
+ *   echo "s 16000 16100 4"  > pon_reg    scan a range, step 4
+ *   cat pon_reg                          show what the last command saw
+ *
+ * Every access is also printed at KERN_EMERG, so a stall shows up on the
+ * serial console with the exact register in front of it.
+ */
+static char zx_reg_log[4096];
+static size_t zx_reg_log_len;
+
+static void zx_reg_emit(const char *fmt, ...)
+{
+	va_list args;
+	int room;
+	int n;
+
+	room = (int)sizeof(zx_reg_log) - (int)zx_reg_log_len - 1;
+	if (room <= 1)
+		return;
+	va_start(args, fmt);
+	n = vscnprintf(zx_reg_log + zx_reg_log_len, room, fmt, args);
+	va_end(args);
+	zx_reg_log_len += n;
+}
+
+static ssize_t pon_reg_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	char cmd[16];
+	unsigned int a, b, step;
+	int n;
+
+	if (!zx_pon_hw)
+		return -ENODEV;
+
+	n = sscanf(buf, "%15s %x %x %x", cmd, &a, &b, &step);
+	if (n < 2)
+		return -EINVAL;
+
+	zx_reg_log_len = 0;
+	zx_reg_log[0] = 0;
+
+	if (!strcmp(cmd, "r")) {
+		u32 v = zx_xmac_r(a);
+
+		zx_reg_emit("%05x = %08x\n", a, v);
+		pr_emerg("zxpon: r %05x = %08x\n", a, v);
+	} else if (!strcmp(cmd, "w") && n >= 3) {
+		pr_emerg("zxpon: w %05x <- %08x\n", a, b);
+		zx_xmac_w(a, b);
+		zx_reg_emit("%05x <- %08x (now %08x)\n", a, b, zx_xmac_r(a));
+		pr_emerg("zxpon: w %05x now %08x\n", a, zx_xmac_r(a));
+	} else if (!strcmp(cmd, "m") && n >= 4) {
+		u32 was = zx_xmac_r(a);
+
+		pr_emerg("zxpon: m %05x was %08x\n", a, was);
+		zx_xmac_w(a, (was & ~b) | step);
+		zx_reg_emit("%05x %08x -> %08x (clear %08x set %08x)\n",
+			    a, was, zx_xmac_r(a), b, step);
+		pr_emerg("zxpon: m %05x now %08x\n", a, zx_xmac_r(a));
+	} else if (!strcmp(cmd, "s")) {
+		unsigned int i;
+
+		if (!step)
+			step = 4;
+		if (b < a || b - a > 0x800)
+			return -EINVAL;
+		pr_emerg("zxpon: s %05x..%05x/%x\n", a, b, step);
+		for (i = a; i <= b; i += step) {
+			u32 v = zx_xmac_r(i);
+
+			zx_reg_emit("%05x=%08x%s", i, v,
+				    (((i - a) / step) % 4 == 3) ? "\n" : " ");
+		}
+		zx_reg_emit("\n");
+		pr_emerg("zxpon: scan done\n");
+	} else {
+		return -EINVAL;
+	}
+	return count;
+}
+
+static ssize_t pon_reg_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	if (!zx_reg_log_len)
+		return sysfs_emit(buf, "no command yet\n");
+	return sysfs_emit(buf, "%s", zx_reg_log);
+}
+static DEVICE_ATTR_RW(pon_reg);
 
 /* The last few management frames, request and reply, in order. */
 static ssize_t pon_omci_show(struct device *dev, struct device_attribute *attr,
@@ -1313,6 +1464,8 @@ void zx279133_pon_attach(struct net_device *ndev)
 		dev_warn(&ndev->dev, "pon_probe sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_arm))
 		dev_warn(&ndev->dev, "pon_arm sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_reg))
+		dev_warn(&ndev->dev, "pon_reg sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_omci))
 		dev_warn(&ndev->dev, "pon_omci sysfs not created\n");
 	zx_omci = alloc_netdev(0, "omci", NET_NAME_UNKNOWN, zxpon_omci_setup);
@@ -1361,6 +1514,7 @@ void zx279133_pon_stop(void)
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_tables);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_probe);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_arm);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_reg);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_omci);
 	}
 	zx_pon_hw = NULL;
