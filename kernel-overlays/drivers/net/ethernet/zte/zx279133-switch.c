@@ -4319,7 +4319,8 @@ zx279133_switch_outerphy_apply_speed_locked(struct zx279133_switch *priv,
 			 "the 2.5G jack: lane programmed for 2500BASE-X (speed 6)\n");
 	else if (link_speed == SPEED_100)
 		dev_info(priv->dev,
-			 "the 2.5G jack: lane programmed for 100M SGMII (XMAC speed 3)\n");
+			 "the 2.5G jack: lane programmed for 100M SGMII (XMAC speed %u)\n",
+			 speed_code);
 	else
 		dev_info(priv->dev,
 			 "the 2.5G jack: lane programmed for 1G (speed 3)\n");
