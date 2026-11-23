@@ -1,12 +1,17 @@
 /*
  * zxponctl - minimal generic-netlink client for the "zxpon" family.
  *
- * Only one verb is needed on the bench: hand a downstream PLOAM frame to the
- * driver so the O2/O3 -> O4 -> O5 half of the state machine can be exercised
- * with no fibre in the jack.  libnl is not present on this image, so the few
- * netlink messages involved are built by hand.
+ * The bench verbs: hand a downstream PLOAM or OMCI frame to the driver, or
+ * write one T-CONT / GEM table entry, and let the driver's own readback say
+ * whether the register took it.  libnl is not present on this image, so the
+ * few netlink messages involved are built by hand.
  *
  *   zxponctl ploam <96 hex chars>   # 48-byte frame, MIC recomputed in kernel
+ *   zxponctl omci-rx <96 hex chars> # downstream OMCI; the reply is sent out
+ *   zxponctl omci <96 hex chars>    # push one OMCI frame to the IDM queue
+ *   zxponctl tcont <alloc>          # add a T-CONT holding that AllocID
+ *   zxponctl omcc <alloc>           # pin T-CONT 0 (the OMCC) to that AllocID
+ *   zxponctl gem <gem id>           # mark a downstream GEM port present
  *   zxponctl family                 # print the resolved family id
  *
  * Build (OpenWrt musl toolchain):
@@ -27,7 +32,13 @@
 #define CMD_PLOAM_RX		8
 #define ATTR_PLOAM_FRAME	9
 #define CMD_OMCI_TX		7
+#define CMD_OMCI_RX		9
 #define ATTR_OMCI_FRAME		8
+#define CMD_ADD_TCONT		3
+#define CMD_ADD_GEM		4
+#define ATTR_ALLOC		4
+#define ATTR_GEM		5
+#define ATTR_OMCC		6
 #define PLOAM_LEN		48
 
 #define NLA_ALIGNTO_		4
@@ -162,6 +173,28 @@ static int hexval(int c)
 	return -1;
 }
 
+/* One u16 attribute, no payload: the table verbs. */
+static int send_u16(int fd, int family, int cmd, int attr, unsigned int value)
+{
+	struct nlreq r;
+	unsigned short v = (unsigned short)value;
+	int ret;
+
+	memset(&r, 0, sizeof(r));
+	r.nlh.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	r.nlh.nlmsg_type = family;
+	r.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	r.nlh.nlmsg_seq = 3;
+	r.gnl.cmd = cmd;
+	r.gnl.version = GENL_VERSION;
+	if (!nla_put(&r, attr, &v, sizeof(v)))
+		return -EMSGSIZE;
+	if (nl_send(fd, &r) < 0)
+		return -EIO;
+	ret = nl_recv_ack(fd);
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	int fd, family, ret;
@@ -169,7 +202,8 @@ int main(int argc, char **argv)
 
 	if (argc < 2) {
 		fprintf(stderr,
-			"usage: %s ploam <96 hex chars> | family\n", argv[0]);
+			"usage: %s ploam|omci-rx|omci <96 hex chars> | tcont|omcc|gem <id> | family\n",
+			argv[0]);
 		return 2;
 	}
 	fd = nl_open();
@@ -186,11 +220,67 @@ int main(int argc, char **argv)
 		close(fd);
 		return 0;
 	}
+	if (!strcmp(argv[1], "tcont") || !strcmp(argv[1], "omcc") ||
+	    !strcmp(argv[1], "gem")) {
+		unsigned long value;
+		char *end;
+
+		if (argc < 3) {
+			fprintf(stderr, "%s needs a number\n", argv[1]);
+			close(fd);
+			return 2;
+		}
+		value = strtoul(argv[2], &end, 0);
+		if (*end || value > 0xffff) {
+			fprintf(stderr, "bad number %s\n", argv[2]);
+			close(fd);
+			return 2;
+		}
+		if (!strcmp(argv[1], "gem")) {
+			ret = send_u16(fd, family, CMD_ADD_GEM, ATTR_GEM,
+				       (unsigned int)value);
+		} else if (!strcmp(argv[1], "omcc")) {
+			memset(&r, 0, sizeof(r));
+			r.nlh.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+			r.nlh.nlmsg_type = family;
+			r.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+			r.nlh.nlmsg_seq = 4;
+			r.gnl.cmd = CMD_ADD_TCONT;
+			r.gnl.version = GENL_VERSION;
+			{
+				unsigned short alloc = (unsigned short)value;
+				unsigned char omcc = 1;
+
+				if (!nla_put(&r, ATTR_ALLOC, &alloc,
+					     sizeof(alloc)) ||
+				    !nla_put(&r, ATTR_OMCC, &omcc,
+					     sizeof(omcc))) {
+					close(fd);
+					return 2;
+				}
+			}
+			ret = nl_send(fd, &r) < 0 ? -EIO : nl_recv_ack(fd);
+		} else {
+			ret = send_u16(fd, family, CMD_ADD_TCONT, ATTR_ALLOC,
+				       (unsigned int)value);
+		}
+		close(fd);
+		if (ret) {
+			fprintf(stderr, "%s failed: %s (%d)\n", argv[1],
+				strerror(-ret), ret);
+			return 1;
+		}
+		return 0;
+	}
+
 	int cmd, attr;
 
 	if (!strcmp(argv[1], "ploam")) {
 		cmd = CMD_PLOAM_RX;
 		attr = ATTR_PLOAM_FRAME;
+	} else if (!strcmp(argv[1], "omci-rx")) {
+		cmd = CMD_OMCI_RX;
+		attr = ATTR_OMCI_FRAME;
 	} else if (!strcmp(argv[1], "omci")) {
 		cmd = CMD_OMCI_TX;
 		attr = ATTR_OMCI_FRAME;

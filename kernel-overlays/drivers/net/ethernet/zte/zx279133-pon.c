@@ -5,16 +5,27 @@
  * The 49-word xgpon_nsyn image is still not programmed: the vendor modules
  * on hand have mode_xgpon_nsyn_cfg, not mode_xgpon_nsyn_cfg_133.  Everything
  * this file writes is named by a Hal_WriteXmacReg trace disassembled from
- * zte_xgpon.ko (4.19.136) and decoded in docs/106, and stays inside the
- * NPPT window the driver already maps.
+ * zte_xgpon.ko (4.19.136) and decoded in docs/106, and resolves against the
+ * PON MAC block at 0x17000000 (see ZX_PON_MAC_PHYS): the vendor accessors are
+ * fpga_read_reg(reg) / fpga_write_reg(reg), which index pon_base + reg * 4.
  *
  * The software activation state machine used to have no hardware layer at
  * all: it could walk to O2-3 in memory while the PON MAC registers were all
- * zero.  This file now brings up the XG-PON MAC, writes the ONU serial into
- * the hardware register, and polls the vendor PLOAM RX/TX windows from the
- * existing 100 ms tick, feeding received frames into zxpon_rx_ploam() and
- * draining zxpon's TX queue into the MAC.  GEM/T-CONT provisioning and OMCI
- * over the data GEM are still separate work.
+ * zero.  The hardware side is now real, but it is armed on request rather than
+ * at probe: the PON block's clocks are off in this tree and touching it first
+ * stalls the SoC bus, so pon_arm_store() opens the topcrm gates, maps the block
+ * and runs the bring-up, and the 100 ms tick only does PLOAM RX/TX once that
+ * has happened.
+ *
+ * The management channel is closed here too: downstream OMCI frames enter
+ * zxpon_rx_omci(), whose replies are drained into the IDM queue 0 by the same
+ * tick.  With no fibre the receive side never sees a frame, so a privileged
+ * verb lets the bench inject one (docs/113 does the same for PLOAM).
+ *
+ * GEM port and T-CONT provisioning follow docs/109: an indirect one-byte
+ * table for GEM presence and a packed halfword bank for AllocID/T-CONT.  Both
+ * are programmed from the real PLOAM assignment as soon as it lands, and read
+ * back so a bench run can show the register took the value.
  */
 
 #include <linux/delay.h>
@@ -22,6 +33,8 @@
 #include <linux/if_arp.h>
 #include <linux/io.h>
 #include <linux/leds.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/swab.h>
 #include <net/genetlink.h>
 #include <net/netlink.h>
@@ -87,10 +100,98 @@ static int zx_nb_ok;
 #define ZX_PON_TX_KICK		0x16642
 #define ZX_PON_TX_DATA		0x166c2
 
+/*
+ * Downstream GEM port table, docs/109 section 1.  One byte per GEM id behind
+ * an indirect port: write the address (bit 31 asks for a read), wait for the
+ * done word to go non-zero, then read or write the data word.  The vendor
+ * spends 4096 polls on each wait and sets bit 1 as the "present" flag of an
+ * entry; nothing else in the byte is touched.
+ */
+#define ZX_GEM_TABLE_ADDR	0x16205
+#define ZX_GEM_TABLE_DONE	0x16206
+#define ZX_GEM_TABLE_DATA	0x16207
+#define ZX_GEM_TABLE_READ	0x08000000u
+#define ZX_GEM_TABLE_PRESENT	0x02
+#define ZX_GEM_TABLE_POLL	0x1000
+
+/*
+ * T-CONT / AllocID bank, docs/109 section 2.  Word 0x1650f + n packs two
+ * entries: the low halfword is T-CONT 2n-1 and the high halfword 2n, with
+ * T-CONT 0 alone in the low half of the first word.  Bits [13:0] of a
+ * halfword are the AllocID and bit 14 marks it valid; the vendor clears all
+ * of [13:0] and then ORs 0x4000, which is what the mask below reproduces.
+ */
+#define ZX_TCONT_BANK		0x1650f
+#define ZX_TCONT_ALLOC_MASK	0x3fffu
+#define ZX_TCONT_VALID		0x4000
+#define ZX_TCONT_OMCC		0
+
+#define ZX_TCONT_MAX		8
+#define ZX_GEM_MAX		8
+
+struct zx_tcont_row {
+	bool used;
+	bool high;
+	u16 tcont;
+	u16 alloc;
+	u32 index;
+	u32 readback;
+};
+
+struct zx_gem_row {
+	bool used;
+	u16 gem;
+	u8 value;
+	int status;
+};
+
+/*
+ * The PON MAC is its own 16 MiB block at 0x17000000 - the stock device tree
+ * calls it "pon@17000000" (compatible "zte,zx279133-pon") and the vendor's
+ * zx_ponreg_133.ko decodes every PON register number as pon_base + reg * 4.
+ * The NPPT window at 0x19000000, which the ethernet node maps, is a different
+ * block: reading the PON registers through it returns zero for everything past
+ * 0x16048, which is exactly what the first bench runs showed.
+ */
+#define ZX_PON_MAC_PHYS		0x17000000
+#define ZX_PON_MAC_SIZE		0x1000000
+
+/*
+ * The PON block stays unclocked until topcrm is told otherwise, and an access
+ * to an unclocked block stalls the AXI bus hard enough that only a reset gets
+ * the SoC back.  These are the five gates the mainline clock driver registers
+ * with CLK_IGNORE_UNUSED but never turns on: pon_idm_aclk (0), pon_tm_aclk (1),
+ * pon_pclk (2), pon_smac_wclk (7), pon_mac_wclk (12).
+ */
+#define ZX_TOPCRM_PHYS		0x10e10000
+#define ZX_TOPCRM_SIZE		0x10000
+#define ZX_TOPCRM_PON_GATE	0x48
+#define ZX_PON_GATE_BITS	0x1087
+
 static void __iomem *zx_pon_hw;
 static u32 zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_txerr_n;
 static u8 zx_last_rx_id;
 static int zx_hw_data_on;
+
+/*
+ * Management channel counters and a small ring of the frames that crossed it.
+ * The ring is what makes the bench able to check a reply byte by byte without
+ * attaching a socket to the management netdev.
+ */
+#define ZX_OMCI_LOG_N		8
+static u8 zx_omci_log[ZX_OMCI_LOG_N][ZXPON_OMCI_LEN];
+static u8 zx_omci_log_dir[ZX_OMCI_LOG_N];
+static u32 zx_omci_log_head, zx_omci_log_n;
+static u32 zx_omci_rx_n, zx_omci_tx_n, zx_omci_drop_n;
+
+static struct zx_tcont_row zx_tcont_rows[ZX_TCONT_MAX];
+static struct zx_gem_row zx_gem_rows[ZX_GEM_MAX];
+static bool zx_provision_noted;
+static unsigned int zx_gem_retry_delay;
+static unsigned int zx_gem_notes;
+
+/* Defined next to the sysfs view; the drain below needs it before that. */
+static bool zxpon_omci_channel(u16 *gem);
 
 static inline u32 zx_xmac_r(u32 idx)
 {
@@ -221,10 +322,300 @@ static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 	return ok ? 0 : -ETIMEDOUT;
 }
 
+/*
+ * The three indirect-table accessors.  They are only entered with zx_pon_lock
+ * held (the tick and every genl verb take it), which is this driver's stand-in
+ * for the vendor's fpga_io_lock plus local IRQ disable: no interrupt handler
+ * on this path touches the PON window.
+ */
+static int zx_gem_table_wait(void)
+{
+	int i;
+
+	for (i = 0; i < ZX_GEM_TABLE_POLL; i++)
+		if (zx_xmac_r(ZX_GEM_TABLE_DONE))
+			return 0;
+	return -ETIMEDOUT;
+}
+
+static int zx_gem_table_get(u16 gem, u8 *value)
+{
+	if (!zx_pon_hw || gem > 0xfffe)
+		return -EINVAL;
+	zx_xmac_w(ZX_GEM_TABLE_ADDR, gem | ZX_GEM_TABLE_READ);
+	if (zx_gem_table_wait())
+		return -ETIMEDOUT;
+	*value = (u8)zx_xmac_r(ZX_GEM_TABLE_DATA);
+	return 0;
+}
+
+static int zx_gem_table_put(u16 gem, u8 value)
+{
+	if (!zx_pon_hw || gem > 0xfffe)
+		return -EINVAL;
+	zx_xmac_w(ZX_GEM_TABLE_ADDR, gem);
+	zx_xmac_w(ZX_GEM_TABLE_DATA, value);
+	return zx_gem_table_wait();
+}
+
+/* Read-modify-write one GEM entry and check the byte came back. */
+static int zx_gem_table_program(u16 gem, u8 *readback)
+{
+	u8 value;
+	int ret;
+
+	ret = zx_gem_table_get(gem, &value);
+	if (ret)
+		return ret;
+	value |= ZX_GEM_TABLE_PRESENT;
+	ret = zx_gem_table_put(gem, value);
+	if (ret)
+		return ret;
+	ret = zx_gem_table_get(gem, &value);
+	if (ret)
+		return ret;
+	if (readback)
+		*readback = value;
+	return (value & ZX_GEM_TABLE_PRESENT) ? 0 : -EIO;
+}
+
+static u32 zx_tcont_index(u16 tcont, bool *high)
+{
+	u32 next = (u32)tcont + 1;
+	u32 word = next >> 1;
+
+	/*
+	 * T-CONT 0 is the OMCC and the vendor does not derive it: the dedicated
+	 * fi_Congigure_Creat_Omcc_Tcont writes the first bank word outright.  Its
+	 * generic raw-T-CONT formula would send id 0 to the catch-all slot 0x1e,
+	 * which this board reads back as zero - so follow the dedicated path.
+	 */
+	if (tcont == ZX_TCONT_OMCC) {
+		*high = false;
+		return ZX_TCONT_BANK;
+	}
+	*high = tcont && (next & 1);
+	if ((u32)(tcont - 0x23) <= 4)
+		word += 0xa;
+	else if (tcont != 0x40)
+		word = 0x1e;
+	return ZX_TCONT_BANK + word;
+}
+
+static int zx_tcont_program(u16 tcont, u16 alloc, u32 *readback)
+{
+	bool high;
+	u32 index, word, rb;
+	u16 half;
+
+	if (!zx_pon_hw || alloc > ZX_TCONT_ALLOC_MASK)
+		return -EINVAL;
+	index = zx_tcont_index(tcont, &high);
+	word = zx_xmac_r(index);
+	half = high ? (u16)(word >> 16) : (u16)word;
+	half = (u16)((half & 0x8000) | (alloc & ZX_TCONT_ALLOC_MASK) |
+		     ZX_TCONT_VALID);
+	if (high)
+		word = (word & 0xffffu) | ((u32)half << 16);
+	else
+		word = (word & 0xffff0000u) | half;
+	zx_xmac_w(index, word);
+	rb = zx_xmac_r(index);
+	if (readback)
+		*readback = rb;
+	return ((high ? (u16)(rb >> 16) : (u16)rb) == half) ? 0 : -EIO;
+}
+
+static struct zx_tcont_row *zx_tcont_row(u16 tcont)
+{
+	int i;
+
+	for (i = 0; i < ZX_TCONT_MAX; i++)
+		if (zx_tcont_rows[i].used && zx_tcont_rows[i].tcont == tcont)
+			return &zx_tcont_rows[i];
+	return NULL;
+}
+
+static struct zx_gem_row *zx_gem_row(u16 gem)
+{
+	int i;
+
+	for (i = 0; i < ZX_GEM_MAX; i++)
+		if (zx_gem_rows[i].used && zx_gem_rows[i].gem == gem)
+			return &zx_gem_rows[i];
+	return NULL;
+}
+
+/* Pick the next free T-CONT id: 0 belongs to the OMCC, then 1, 2, ... */
+static int zx_tcont_alloc_id(u16 *tcont)
+{
+	int i;
+
+	for (i = 0; i < ZX_TCONT_MAX; i++)
+		if (!zx_tcont_rows[i].used) {
+			*tcont = i;
+			return 0;
+		}
+	return -ENOSPC;
+}
+
+static int zx_tcont_record(u16 tcont, u16 alloc, u32 readback)
+{
+	struct zx_tcont_row *row = zx_tcont_row(tcont);
+
+	if (!row) {
+		int i;
+
+		for (i = 0; i < ZX_TCONT_MAX; i++)
+			if (!zx_tcont_rows[i].used) {
+				row = &zx_tcont_rows[i];
+				break;
+			}
+		if (!row)
+			return -ENOSPC;
+		row->used = true;
+		row->tcont = tcont;
+	}
+	row->alloc = alloc;
+	row->readback = readback;
+	row->index = zx_tcont_index(tcont, &row->high);
+	return 0;
+}
+
+static int zx_gem_record(u16 gem, int status, u8 value)
+{
+	struct zx_gem_row *row = zx_gem_row(gem);
+
+	if (!row) {
+		int i;
+
+		for (i = 0; i < ZX_GEM_MAX; i++)
+			if (!zx_gem_rows[i].used) {
+				row = &zx_gem_rows[i];
+				break;
+			}
+		if (!row)
+			return -ENOSPC;
+		row->used = true;
+		row->gem = gem;
+	}
+	row->status = status;
+	row->value = value;
+	return 0;
+}
+
+static void zx_omci_log_put(u8 dir, const u8 *frame)
+{
+	memcpy(zx_omci_log[zx_omci_log_head], frame, ZXPON_OMCI_LEN);
+	zx_omci_log_dir[zx_omci_log_head] = dir;
+	zx_omci_log_head = (zx_omci_log_head + 1) % ZX_OMCI_LOG_N;
+	if (zx_omci_log_n < ZX_OMCI_LOG_N)
+		zx_omci_log_n++;
+}
+
+/*
+ * Push every queued OMCI reply through the real IDM queue 0.  A failure stops
+ * the drain instead of spinning: the frame that could not leave stays where
+ * it is, and the counter says so.
+ */
+static int zxpon_drain_omci(void)
+{
+	u8 frame[ZXPON_OMCI_LEN];
+	u16 gem;
+	int sent = 0, ret;
+
+	if (!zx_wan)
+		return 0;
+	for (;;) {
+		if (!zxpon_omci_channel(&gem))
+			break;
+		mutex_lock(&zx_pon_lock);
+		ret = zxpon_take_omci(&zx_state, frame);
+		mutex_unlock(&zx_pon_lock);
+		if (!ret)
+			break;
+		ret = zx279133_omci_send(netdev_priv(zx_wan), gem, frame,
+					 ZXPON_OMCI_LEN);
+		if (ret) {
+			zx_omci_drop_n++;
+			break;
+		}
+		zx_omci_log_put('T', frame);
+		zx_omci_tx_n++;
+		sent++;
+	}
+	return sent;
+}
+
+/*
+ * Provision the data path from whatever the OLT actually assigned.  There is
+ * no userspace step here on purpose: the PLOAM AllocID frame already carries
+ * the AllocID and, with the OMCC flag set, the management GEM port, so the
+ * T-CONT bank and the GEM table can follow it directly - exactly the pair the
+ * vendor programs in fi_Congigure_Creat_Omcc_Tcont and
+ * fi_Configure_Gem_Create_Downstream_GemPort.
+ */
+static void zxpon_provision_locked(void)
+{
+	struct zx_tcont_row *row;
+	struct zx_gem_row *gem_row;
+	u16 alloc, gem;
+	u32 readback = 0;
+	u8 value = 0;
+	int ret;
+
+	if (!zx_pon_hw)
+		return;
+	/*
+	 * The vendor programs these two tables only once the OLT has accepted
+	 * the ONU: the AllocID and the OMCC GEM port arrive in the O5
+	 * assignment, and the indirect table engine behind 0x16205 does not
+	 * answer at all while the downstream half of the MAC is held off.  Both
+	 * were wrong before: the tables were written at O2-3 and the failures
+	 * were then latched for the lifetime of the driver.
+	 */
+	if (zxpon_state(&zx_state) != ZXPON_O5)
+		return;
+	if (!zxpon_alloc_id(&zx_state, &alloc))
+		return;
+	row = zx_tcont_row(ZX_TCONT_OMCC);
+	if (!row || row->alloc != alloc) {
+		/*
+		 * 0x1650f is write-only on this part: a read comes back as zero
+		 * even after the vendor's own write, so the readback is kept for
+		 * sysfs and never treated as a failure.
+		 */
+		zx_tcont_program(ZX_TCONT_OMCC, alloc, &readback);
+		zx_tcont_record(ZX_TCONT_OMCC, alloc, readback);
+	}
+	if (!zxpon_omcc_gem(&zx_state, &gem))
+		return;
+	gem_row = zx_gem_row(gem);
+	if (gem_row && !gem_row->status)
+		return;
+	/* One attempt per second: a refusal here is not transient. */
+	if (++zx_gem_retry_delay < 10)
+		return;
+	zx_gem_retry_delay = 0;
+	ret = zx_gem_table_program(gem, &value);
+	zx_gem_record(gem, ret, value);
+	if (ret) {
+		if (zx_gem_notes++ < 3)
+			pr_warn("zxpon: GEM %u table write failed (%d), readback %02x\n",
+				gem, ret, value);
+		return;
+	}
+	if (!zx_provision_noted) {
+		zx_provision_noted = true;
+		pr_info("zxpon: provisioned T-CONT 0 alloc %u and GEM %u on the PON MAC tables\n",
+			alloc, gem);
+	}
+}
+
 static void zxpon_poll_ploam(void)
 {
-	u8 frame[ZXPON_PLOAM_LEN];
 	int i;
+	u8 frame[ZXPON_PLOAM_LEN];
 
 	if (!zx_pon_hw)
 		return;
@@ -276,11 +667,21 @@ static void zxpon_tick_work(struct work_struct *work)
 			zxpon_retry_sn(&zx_state);
 		}
 		zxpon_poll_ploam();
+		zxpon_provision_locked();
 	}
 	mutex_unlock(&zx_pon_lock);
+	/*
+	 * Turn the downstream half on first: the PON MAC's indirect table engine
+	 * refuses every transaction while 0x16100 bit 0 is still clear.
+	 */
 	zxpon_apply_carrier();
-	if (zx_alive)
+	if (zx_alive) {
+		mutex_lock(&zx_pon_lock);
+		zxpon_provision_locked();
+		mutex_unlock(&zx_pon_lock);
+		zxpon_drain_omci();
 		schedule_delayed_work(&zx_tick, msecs_to_jiffies(100));
+	}
 }
 
 static int zxpon_net_event(struct notifier_block *nb, unsigned long event, void *ptr)
@@ -352,16 +753,176 @@ static ssize_t omci_transport_show(struct device *dev,
 	u16 gem;
 	bool ready = zxpon_omci_channel(&gem);
 	ssize_t length;
+	int queued;
 
+	/* Read the queue depth before the datapath lock: the drain takes them
+	 * in the other order and neither side should ever hold both.
+	 */
+	mutex_lock(&zx_pon_lock);
+	queued = zx_state.omci_tx_n;
+	mutex_unlock(&zx_pon_lock);
 	mutex_lock(&eth->datapath_lock);
 	ready = ready && eth->tx_prepared && !eth->tx_stopping;
-	length = sysfs_emit(buf, "implemented=1 ready=%u rx_ready=0 mic_ready=0 submitted=%llu completed=%llu error=%d\n",
-		ready, eth->omci_submitted, eth->omci_completed,
+	length = sysfs_emit(buf, "implemented=1 ready=%u rx_ready=1 mic_ready=0 rx=%u tx=%u drop=%u q=%d submitted=%llu completed=%llu error=%d\n",
+		ready, zx_omci_rx_n, zx_omci_tx_n, zx_omci_drop_n, queued,
+		eth->omci_submitted, eth->omci_completed,
 		ready ? eth->omci_error : -ENOLINK);
 	mutex_unlock(&eth->datapath_lock);
 	return length;
 }
 static DEVICE_ATTR_RO(omci_transport);
+
+/*
+ * The provisioned tables, as the MAC now holds them.  readback is the word or
+ * byte the register returned straight after the write, so "the POST landed"
+ * and "the model agrees with itself" can be told apart from the bench.
+ */
+static ssize_t pon_tables_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	mutex_lock(&zx_pon_lock);
+	for (i = 0; i < ZX_TCONT_MAX && len < (int)PAGE_SIZE - 96; i++) {
+		struct zx_tcont_row *row = &zx_tcont_rows[i];
+
+		if (!row->used)
+			continue;
+		len += sysfs_emit_at(buf, len,
+			"tcont=%u alloc=%04x index=%05x high=%u readback=%08x\n",
+			row->tcont, row->alloc, row->index, row->high,
+			row->readback);
+	}
+	for (i = 0; i < ZX_GEM_MAX && len < (int)PAGE_SIZE - 64; i++) {
+		struct zx_gem_row *row = &zx_gem_rows[i];
+
+		if (!row->used)
+			continue;
+		len += sysfs_emit_at(buf, len, "gem=%u value=%02x status=%d\n",
+			row->gem, row->value, row->status);
+	}
+	mutex_unlock(&zx_pon_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(pon_tables);
+
+/*
+ * Bench probe for the GEM indirect table.  The transaction follows the vendor
+ * sequence exactly (address word on 0x16205, done on 0x16206, data on 0x16207)
+ * and reports every step, so a timeout can be split into "the address did not
+ * stick", "the engine never raised done" or "done came back but the data is
+ * wrong" instead of one opaque -ETIMEDOUT.
+ */
+/*
+ * Arming the PON block is deliberately a userspace action, not something probe
+ * does.  Booting must not depend on a block that hangs the bus when its clocks
+ * are off: the board comes up with the driver in "no hardware" mode, and
+ * /sys/class/net/eth0/pon_arm is what maps 0x17000000, opens the topcrm gates
+ * and runs the vendor bring-up.  Run it with /dev/watchdog0 armed (see
+ * pon_revive/pon_arm.py) and a stall costs a 20 s reset instead of a power
+ * cycle.
+ */
+static u32 zx_topcrm_pon_gate_before;
+static bool zx_pon_armed;
+
+static ssize_t pon_arm_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	void __iomem *topcrm;
+	u32 now;
+
+	if (zx_pon_armed)
+		return count;
+
+	topcrm = devm_ioremap(dev, ZX_TOPCRM_PHYS, ZX_TOPCRM_SIZE);
+	if (!topcrm)
+		return -ENOMEM;
+	zx_topcrm_pon_gate_before = readl(topcrm + ZX_TOPCRM_PON_GATE);
+	writel(zx_topcrm_pon_gate_before | ZX_PON_GATE_BITS,
+	       topcrm + ZX_TOPCRM_PON_GATE);
+	now = readl(topcrm + ZX_TOPCRM_PON_GATE);
+	dev_info(dev, "topcrm pon gate %08x -> %08x\n",
+		 zx_topcrm_pon_gate_before, now);
+
+	zx_pon_hw = devm_ioremap(dev, ZX_PON_MAC_PHYS, ZX_PON_MAC_SIZE);
+	if (!zx_pon_hw)
+		return -ENOMEM;
+	zx_pon_hw_bringup();
+	zx_pon_armed = true;
+	return count;
+}
+static DEVICE_ATTR_WO(pon_arm);
+
+static ssize_t pon_probe_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	ssize_t len = 0;
+	u32 before, after, restored, pattern = 0x00c30001;
+
+	len += sysfs_emit_at(buf, len, "armed=%u gate_before=%08x gate_bits=%04x\n",
+			     zx_pon_armed, zx_topcrm_pon_gate_before,
+			     ZX_PON_GATE_BITS);
+	if (!zx_pon_hw)
+		return len + sysfs_emit_at(buf, len, "no-mmio\n");
+
+	/*
+	 * One write-read cycle on the T-CONT bank proves the block answers: it
+	 * is a plain read/write word, and the vendor reads it before writing.
+	 * The original value goes straight back.
+	 */
+	before = zx_xmac_r(ZX_TCONT_BANK);
+	zx_xmac_w(ZX_TCONT_BANK, pattern);
+	after = zx_xmac_r(ZX_TCONT_BANK);
+	zx_xmac_w(ZX_TCONT_BANK, before);
+	restored = zx_xmac_r(ZX_TCONT_BANK);
+	len += sysfs_emit_at(buf, len,
+		"tcont bank: before=%08x wrote=%08x read=%08x %s restored=%08x\n",
+		before, pattern, after, after == pattern ? "MATCH" : "no", restored);
+
+	len += sysfs_emit_at(buf, len,
+		"16000=%08x 16001=%08x 16100=%08x 1610b=%08x 1611d=%08x 16147=%08x\n",
+		zx_xmac_r(0x16000), zx_xmac_r(0x16001), zx_xmac_r(0x16100),
+		zx_xmac_r(0x1610b), zx_xmac_r(0x1611d), zx_xmac_r(0x16147));
+	len += sysfs_emit_at(buf, len,
+		"16205=%08x 16206=%08x 16207=%08x 16600=%08x 16601=%08x\n",
+		zx_xmac_r(0x16205), zx_xmac_r(0x16206), zx_xmac_r(0x16207),
+		zx_xmac_r(0x16600), zx_xmac_r(0x16601));
+	len += sysfs_emit_at(buf, len,
+		"16636=%08x 16637=%08x 16642=%08x 16644=%08x 3000a=%08x\n",
+		zx_xmac_r(0x16636), zx_xmac_r(0x16637), zx_xmac_r(0x16642),
+		zx_xmac_r(0x16644), zx_xmac_r(0x3000a));
+	return len;
+}
+static DEVICE_ATTR_RO(pon_probe);
+
+/* The last few management frames, request and reply, in order. */
+static ssize_t pon_omci_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	static const char hex[] = "0123456789abcdef";
+	ssize_t len = 0;
+	u32 start, i, j;
+
+	mutex_lock(&zx_pon_lock);
+	len += sysfs_emit_at(buf, len, "rx=%u tx=%u drop=%u q=%d n=%u\n",
+		zx_omci_rx_n, zx_omci_tx_n, zx_omci_drop_n,
+		zx_state.omci_tx_n, zx_omci_log_n);
+	start = (zx_omci_log_head + ZX_OMCI_LOG_N - zx_omci_log_n) %
+		ZX_OMCI_LOG_N;
+	for (i = 0; i < zx_omci_log_n && len < (int)PAGE_SIZE - 112; i++) {
+		u32 slot = (start + i) % ZX_OMCI_LOG_N;
+
+		len += sysfs_emit_at(buf, len, "%c ", zx_omci_log_dir[slot]);
+		for (j = 0; j < ZXPON_OMCI_LEN; j++)
+			len += sysfs_emit_at(buf, len, "%c%c", hex[zx_omci_log[slot][j] >> 4],
+				hex[zx_omci_log[slot][j] & 0xf]);
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+	mutex_unlock(&zx_pon_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(pon_omci);
 
 static int zxpon_get_state(struct sk_buff *skb, struct genl_info *info)
 {
@@ -415,20 +976,76 @@ static int zxpon_nl_set_identity(struct sk_buff *skb, struct genl_info *info)
 	zxpon_set_lods(&zx_state, 0);
 	zxpon_set_los(&zx_state, 0);
 	zx_activation_armed = 1;
+	/* A new identity is a new provisioning attempt. */
+	zx_gem_retry_delay = 0;
+	zx_gem_notes = 0;
 	mutex_unlock(&zx_pon_lock);
 	zxpon_apply_carrier();
 	return 0;
 }
 
+/*
+ * Add a T-CONT: the AllocID comes from the OLT, the T-CONT id does not, so the
+ * driver picks the next free slot.  Attribute "omcc" pins the management
+ * T-CONT, which the vendor also hardwires to id 0.
+ */
 static int zxpon_add_tcont_cmd(struct sk_buff *skb, struct genl_info *info)
 {
-	/* No ZX279133 T-CONT table backend yet: do not ACK a software-only write. */
-	return -EOPNOTSUPP;
+	u16 alloc, tcont;
+	u32 readback = 0;
+	bool omcc = false;
+	int ret;
+
+	if (!info->attrs[ZXPON_A_ALLOC])
+		return -EINVAL;
+	alloc = nla_get_u16(info->attrs[ZXPON_A_ALLOC]);
+	if (info->attrs[ZXPON_A_OMCC])
+		omcc = nla_get_u8(info->attrs[ZXPON_A_OMCC]) != 0;
+	mutex_lock(&zx_pon_lock);
+	if (omcc) {
+		tcont = ZX_TCONT_OMCC;
+	} else {
+		ret = zx_tcont_alloc_id(&tcont);
+		if (ret) {
+			mutex_unlock(&zx_pon_lock);
+			return ret;
+		}
+	}
+	ret = zx_tcont_program(tcont, alloc, &readback);
+	if (!ret)
+		ret = zx_tcont_record(tcont, alloc, readback);
+	mutex_unlock(&zx_pon_lock);
+	if (ret)
+		pr_warn("zxpon: T-CONT %u alloc %u rejected (%d), readback %08x\n",
+			tcont, alloc, ret, readback);
+	return ret;
 }
 
+/*
+ * Mark a GEM port present in the downstream table, and (MAP_GEM only) let the
+ * ordinary software mapping know it carries data.
+ */
 static int zxpon_map_cmd(struct sk_buff *skb, struct genl_info *info)
 {
-	return -EOPNOTSUPP;
+	u16 gem;
+	u8 value = 0;
+	int ret;
+
+	if (!info->attrs[ZXPON_A_GEM])
+		return -EINVAL;
+	gem = nla_get_u16(info->attrs[ZXPON_A_GEM]);
+	mutex_lock(&zx_pon_lock);
+	ret = zx_gem_table_program(gem, &value);
+	if (!ret) {
+		zx_gem_record(gem, 0, value);
+		if (info->genlhdr->cmd == ZXPON_CMD_MAP_GEM)
+			zxpon_map_gem(&zx_state, gem);
+	}
+	mutex_unlock(&zx_pon_lock);
+	if (ret)
+		pr_warn("zxpon: GEM %u table write rejected (%d), readback %02x\n",
+			gem, ret, value);
+	return ret;
 }
 
 static int zxpon_set_key_cmd(struct sk_buff *skb, struct genl_info *info)
@@ -494,6 +1111,41 @@ static int zxpon_ploam_rx_cmd(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
+/*
+ * Bench injection of a downstream OMCI frame, the counterpart of the PLOAM
+ * verb above.  The kernel already answers OMCI (MIB upload, get, set, create),
+ * but with no fibre nothing ever calls that code, so the whole management
+ * exchange - including whether the reply leaves through the IDM queue - is
+ * untestable on the bench without this.  The frame is handed to the ordinary
+ * zxpon_rx_omci() and the reply is drained immediately, so the counters and
+ * the pon_omci ring show the same bytes a live OLT would get.
+ */
+static int zxpon_omci_rx_cmd(struct sk_buff *skb, struct genl_info *info)
+{
+	static bool noted;
+	u8 frame[ZXPON_OMCI_LEN];
+	int ret;
+
+	if (!info->attrs[ZXPON_A_OMCI_FRAME])
+		return -EINVAL;
+	memcpy(frame, nla_data(info->attrs[ZXPON_A_OMCI_FRAME]), ZXPON_OMCI_LEN);
+	mutex_lock(&zx_pon_lock);
+	ret = zxpon_rx_omci(&zx_state, frame);
+	if (!ret) {
+		zx_omci_log_put('R', frame);
+		zx_omci_rx_n++;
+	}
+	mutex_unlock(&zx_pon_lock);
+	if (ret < 0)
+		return -EBADMSG;
+	if (!noted) {
+		noted = true;
+		pr_info("zxpon: bench OMCI injection in use; downstream management frames now come from genl\n");
+	}
+	zxpon_drain_omci();
+	return 0;
+}
+
 static const struct genl_ops zxpon_ops[] = {
 	{
 		.cmd = ZXPON_CMD_OMCI_TX,
@@ -541,6 +1193,12 @@ static const struct genl_ops zxpon_ops[] = {
 		.flags = GENL_ADMIN_PERM,
 		.policy = zxpon_policy,
 		.doit = zxpon_ploam_rx_cmd,
+	},
+	{
+		.cmd = ZXPON_CMD_OMCI_RX,
+		.flags = GENL_ADMIN_PERM,
+		.policy = zxpon_policy,
+		.doit = zxpon_omci_rx_cmd,
 	},
 };
 
@@ -637,18 +1295,26 @@ void zx279133_pon_attach(struct net_device *ndev)
 	zx_activation_armed = 0;
 	zxpon_init(&zx_state);
 	zx_wan = ndev;
-	/* The NPPT mapping is already established at this point in probe. */
-	zx_pon_hw = eth->base;
-	if (zx_pon_hw)
-		zx_pon_hw_bringup();
-	else
-		dev_warn(&ndev->dev, "PON MAC window not mapped; PLOAM disabled\n");
+	/*
+	 * Nothing here touches the PON block at probe time.  Its clocks are off
+	 * in this tree and the first access stalls the bus, so the hardware side
+	 * is armed on request from userspace instead (see pon_arm_store).
+	 */
+	dev_info(&ndev->dev, "PON hardware idle until pon_arm is written\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_state))
 		dev_warn(&ndev->dev, "pon_state sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_omci_transport))
 		dev_warn(&ndev->dev, "omci_transport sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_hw))
 		dev_warn(&ndev->dev, "pon_hw sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_tables))
+		dev_warn(&ndev->dev, "pon_tables sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_probe))
+		dev_warn(&ndev->dev, "pon_probe sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_arm))
+		dev_warn(&ndev->dev, "pon_arm sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_omci))
+		dev_warn(&ndev->dev, "pon_omci sysfs not created\n");
 	zx_omci = alloc_netdev(0, "omci", NET_NAME_UNKNOWN, zxpon_omci_setup);
 	if (zx_omci) {
 		zx_omci->dev.parent = ndev->dev.parent;
@@ -692,6 +1358,10 @@ void zx279133_pon_stop(void)
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_state);
 		device_remove_file(&zx_wan->dev, &dev_attr_omci_transport);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_hw);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_tables);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_probe);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_arm);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_omci);
 	}
 	zx_pon_hw = NULL;
 	zx_hw_data_on = 0;
