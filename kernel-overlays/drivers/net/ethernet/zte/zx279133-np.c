@@ -42,7 +42,17 @@ void zx279133_route_set(struct zx279133_eth *eth, bool enabled)
 			 value & ~ZX279133_ROUTE_CLK_EN,
 	       eth->base + ZX279133_ROUTE_CLK);
 
-	regmap_write(eth->pon_route, 0, enabled ? 0 : 1);
+	/*
+	 * The vendor's ponserdes_to_xmac1_en_set(en) writes (en != 1) here, so
+	 * this word is 1 in the state a working unit runs in: the CMCC
+	 * HX5-9saLite reads 0x17000080 = 0x00000001 while at O5 with traffic,
+	 * and its NPPT+0x2438 is 0x7 (bit2 set) - the pair the en == 0 branch
+	 * of that function produces.  This driver used to write the opposite
+	 * polarity.  Setting it on this board (RAM write) does not by itself
+	 * clear the framer's LOF, so it is alignment with the known-good unit
+	 * rather than a fix; docs/121.
+	 */
+	regmap_write(eth->pon_route, 0, enabled ? 1 : 0);
 
 	/* ROUTE_XMAC1 must be SET while the PON path is live.  Measured on the
 	 * working CMCC HX5-9saLite at O5 with traffic: nppt+0x2438 = 0x7 (all
