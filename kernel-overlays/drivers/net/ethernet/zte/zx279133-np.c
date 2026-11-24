@@ -44,9 +44,16 @@ void zx279133_route_set(struct zx279133_eth *eth, bool enabled)
 
 	regmap_write(eth->pon_route, 0, enabled ? 0 : 1);
 
+	/* ROUTE_XMAC1 must be SET while the PON path is live.  Measured on the
+	 * working CMCC HX5-9saLite at O5 with traffic: nppt+0x2438 = 0x7 (all
+	 * three routes), and the vendor np_133.ko run on this very board via
+	 * RAM bootm leaves the same 0x7.  This driver used to clear the bit on
+	 * enable, which left the PON MAC unrouted out of the NP - the datapath
+	 * stayed silent (rx 0, SDET FIFO 0) no matter what the MAC did.
+	 * docs/120. */
 	value = readl(eth->base + ZX279133_ROUTE_CTRL);
-	writel(enabled ? value & ~ZX279133_ROUTE_XMAC1 :
-			 value | ZX279133_ROUTE_XMAC1,
+	writel(enabled ? value | ZX279133_ROUTE_XMAC1 :
+			 value & ~ZX279133_ROUTE_XMAC1,
 	       eth->base + ZX279133_ROUTE_CTRL);
 }
 
@@ -1275,6 +1282,7 @@ static bool zx279133_soc_block_ok(u32 addr, u32 len)
 		{ 0x16100000, 0x00100000 },	/* Uni SerDes */
 		{ 0x1a000000, 0x00800000 },	/* XPCS0 */
 		{ 0x1b000000, 0x00800000 },	/* XPCS1 */
+		{ 0x10e10000, 0x00000100 },	/* TOPCRM: PON PLL sel + gate/resets */
 	};
 	unsigned int i;
 

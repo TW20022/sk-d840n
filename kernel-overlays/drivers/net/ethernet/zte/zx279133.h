@@ -561,10 +561,16 @@ extern u16 zx279133_tx_port;
 
 #define ZX279133_SDET_FRAME_CFG		0x2040
 #define ZX279133_SDET_DOWN_FRAME_CFG	0x2044
-#define ZX279133_SDET_UP_MAX_LEN	2048
-#define ZX279133_SDET_UP_MIN_LEN	12
-#define ZX279133_SDET_DOWN_MAX_LEN	2048
-#define ZX279133_SDET_DOWN_MIN_LEN	12
+/* The watchdog windows: (max << shift) | min.  Measured values from the
+ * live HX5 at O5 with traffic are max=16000/min=31 upstream and
+ * max=32384/min=1 downstream (nppt+0x2040 = 0x0fa0001f, +0x2044 =
+ * 0x7e800001); the vendor np_133.ko leaves exactly the same pair on this
+ * board.  The old 2048/12 pair let downstream frames past 2 KiB fall out
+ * of the SDET window. docs/120. */
+#define ZX279133_SDET_UP_MAX_LEN	16000
+#define ZX279133_SDET_UP_MIN_LEN	31
+#define ZX279133_SDET_DOWN_MAX_LEN	32384
+#define ZX279133_SDET_DOWN_MIN_LEN	1
 #define ZX279133_SDET_UP_MAX_SHIFT	14
 #define ZX279133_SDET_DOWN_MAX_SHIFT	16
 
