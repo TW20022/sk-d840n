@@ -29,6 +29,9 @@
 
 #define GENL_FAMILY_NAME	"zxpon"
 #define GENL_VERSION		1
+#define CMD_SET_IDENTITY	2
+#define ATTR_SN			2
+#define ATTR_REGID		3
 #define CMD_PLOAM_RX		8
 #define ATTR_PLOAM_FRAME	9
 #define CMD_OMCI_TX		7
@@ -173,6 +176,62 @@ static int hexval(int c)
 	return -1;
 }
 
+/*
+ * ITU-T G.984.3 serial number: the 12-character text form (4 ASCII vendor
+ * chars + 8 hex digits) packs into the 8 bytes the PLOAM carries.  Vendor
+ * "CMDC" + vssn A133E348 -> 43 4d 44 43 a1 33 e3 48.
+ */
+static int sn_to_bytes(const char *s, unsigned char out[8])
+{
+	int i;
+
+	if (strlen(s) != 12)
+		return -1;
+	memcpy(out, s, 4);
+	for (i = 0; i < 4; i++) {
+		int hi = hexval((unsigned char)s[4 + i * 2]);
+		int lo = hexval((unsigned char)s[5 + i * 2]);
+
+		if (hi < 0 || lo < 0)
+			return -1;
+		out[4 + i] = (unsigned char)((hi << 4) | lo);
+	}
+	return 0;
+}
+
+/* CMD_SET_IDENTITY carries two fixed-length attributes; the driver copies
+ * them verbatim, arms the activation and lets the PLOAM machine start. */
+static int send_identity(int fd, int family, const char *snstr,
+			 const char *regstr)
+{
+	struct nlreq r;
+	unsigned char sn[8];
+	unsigned char regid[36];
+
+	if (sn_to_bytes(snstr, sn)) {
+		fprintf(stderr,
+			"bad SN '%s': want 12 chars, e.g. CMDCA133E348\n",
+			snstr);
+		return -EINVAL;
+	}
+	memset(regid, 0, sizeof(regid));
+	strncpy((char *)regid, regstr, sizeof(regid));
+
+	memset(&r, 0, sizeof(r));
+	r.nlh.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	r.nlh.nlmsg_type = family;
+	r.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	r.nlh.nlmsg_seq = 5;
+	r.gnl.cmd = CMD_SET_IDENTITY;
+	r.gnl.version = GENL_VERSION;
+	if (!nla_put(&r, ATTR_SN, sn, sizeof(sn)) ||
+	    !nla_put(&r, ATTR_REGID, regid, sizeof(regid)))
+		return -EMSGSIZE;
+	if (nl_send(fd, &r) < 0)
+		return -EIO;
+	return nl_recv_ack(fd);
+}
+
 /* One u16 attribute, no payload: the table verbs. */
 static int send_u16(int fd, int family, int cmd, int attr, unsigned int value)
 {
@@ -202,7 +261,7 @@ int main(int argc, char **argv)
 
 	if (argc < 2) {
 		fprintf(stderr,
-			"usage: %s ploam|omci-rx|omci <96 hex chars> | tcont|omcc|gem <id> | family\n",
+			"usage: %s identity <12-char-sn> <reg-id> | ploam|omci-rx|omci <96 hex chars> | tcont|omcc|gem <id> | family\n",
 			argv[0]);
 		return 2;
 	}
@@ -218,6 +277,23 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "family")) {
 		printf("%d\n", family);
 		close(fd);
+		return 0;
+	}
+	if (!strcmp(argv[1], "identity")) {
+		if (argc < 4) {
+			fprintf(stderr,
+				"identity needs <12-char-sn> <reg-id>\n");
+			close(fd);
+			return 2;
+		}
+		ret = send_identity(fd, family, argv[2], argv[3]);
+		close(fd);
+		if (ret) {
+			fprintf(stderr, "identity failed: %s (%d)\n",
+				strerror(-ret), ret);
+			return 1;
+		}
+		printf("identity accepted\n");
 		return 0;
 	}
 	if (!strcmp(argv[1], "tcont") || !strcmp(argv[1], "omcc") ||
