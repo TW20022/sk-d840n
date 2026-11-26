@@ -104,15 +104,28 @@ static void reach_o5(struct zxpon *z)
 static void test_los_from_o5(void)
 {
 	struct zxpon z;
-	uint8_t up[48];
+	uint8_t up[48], f[48], body[8];
+	uint16_t alloc = 0xffff, omcc = 0xffff;
 
 	reach_o5(&z);
+	/* Give O5 a real AllocID/OMCC so we can prove they are dropped. */
+	memset(body, 0, sizeof(body));
+	put16(body, 1);
+	body[2] = ZXPON_ALLOC_F_OMCC;
+	put16(body + 3, 100);
+	ds(f, ZXPON_DS_ASSIGN_ALLOCID, 7, body, 5);
+	expect(zxpon_rx_ploam(&z, f) == 0, "omcc alloc before LOS");
+	expect(zxpon_alloc_id(&z, &alloc) && alloc == 1, "alloc visible in O5");
+	expect(zxpon_omcc_gem(&z, &omcc) && omcc == 100, "omcc visible in O5");
+
 	while (zxpon_take_ploam(&z, up))
 		;
 	zxpon_set_los(&z, 1);
 	expect(zxpon_state(&z) == ZXPON_O1, "LOS returns to O1");
 	expect(!zxpon_take_ploam(&z, up), "LOS sends no serial number");
 	expect(strcmp(zxpon_state_name(&z), "O1") == 0, "state name O1");
+	expect(!zxpon_alloc_id(&z, &alloc), "LOS drops stale AllocID");
+	expect(!zxpon_omcc_gem(&z, &omcc), "LOS drops stale OMCC GEM");
 }
 
 static void test_to1(void)
@@ -143,6 +156,106 @@ static void test_disable(void)
 	expect(zxpon_rx_ploam(&z, f) == 0, "enable");
 	expect(zxpon_state(&z) == ZXPON_O23, "enable returns to O2-3");
 	expect(take_type(&z, ZXPON_US_SERIAL_NUMBER, up), "serial number after enable");
+}
+
+static void test_profile(void)
+{
+	struct zxpon z;
+	uint8_t f[48], body[36], up[48];
+	struct zxpon_profile p;
+	int i;
+
+	arm(&z);
+	memset(body, 0, sizeof(body));
+	/* octet 5: version 3, profile index 2 */
+	body[0] = 0x32;
+	body[1] = 0x01;			/* FEC on */
+	body[2] = 0x04;			/* delimiter: 4 octets */
+	for (i = 0; i < 8; i++)
+		body[3 + i] = (uint8_t)(0xa0 + i);
+	body[11] = 0x06;		/* preamble: 6 octets */
+	body[12] = 0x0a;		/* repeat count 10 */
+	for (i = 0; i < 8; i++)
+		body[13 + i] = (uint8_t)(0x55 + i);
+	for (i = 0; i < 8; i++)
+		body[21 + i] = (uint8_t)(0x10 + i);
+	ds(f, ZXPON_DS_BURST_PROFILE, ZXPON_BCAST_ONUID, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "profile accepted");
+	expect(zxpon_get_profile(&z, 2, &p) == 1, "profile idx 2 learned");
+	expect(p.version == 3 && p.index == 2, "profile version/index");
+	expect(p.fec == 1 && p.delimiter_len == 4, "profile FEC/delimiter");
+	expect(p.preamble_len == 6 && p.preamble_repeat == 10,
+	       "profile preamble length/repeat");
+	expect(p.pon_tag[0] == 0x10 && p.pon_tag[7] == 0x17, "profile PON-TAG");
+	expect(!zxpon_get_profile(&z, 0, &p), "other profile still empty");
+
+	/* Reserved bits set: must not corrupt a learned profile. */
+	body[0] = 0x36;		/* version 3, reserved 1, index 2 */
+	ds(f, ZXPON_DS_BURST_PROFILE, ZXPON_BCAST_ONUID, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "malformed profile accepted/ignored");
+	expect(zxpon_get_profile(&z, 2, &p) && p.version == 3,
+	       "malformed profile does not overwrite");
+
+	/* Losing light discards all learned profiles (G.987.3 12.2.2). */
+	zxpon_set_los(&z, 1);
+	expect(!zxpon_get_profile(&z, 2, &p), "LOS drops burst profiles");
+	zxpon_set_los(&z, 0);
+	expect(zxpon_state(&z) == ZXPON_O23, "light re-enters O2-3");
+	expect(take_type(&z, ZXPON_US_SERIAL_NUMBER, up), "SN after LOS");
+}
+
+/*
+ * Only a directed Profile carries an Acknowledge; the periodic broadcast one
+ * is learned silently.  Reserved bits in the length octets must reject the
+ * frame before it can overwrite a good profile.
+ */
+static void test_profile_ack(void)
+{
+	struct zxpon z;
+	struct zxpon_profile p;
+	uint8_t f[48], body[36], up[48];
+
+	memset(&z, 0, sizeof(z));
+	zxpon_init(&z);
+	reach_o5(&z);
+	while (zxpon_take_ploam(&z, up))
+		;
+
+	memset(body, 0, sizeof(body));
+	body[0] = 0x02;			/* version 0, profile index 2 */
+	body[1] = 0x00;
+	body[2] = 0x04;			/* delimiter: 4 octets */
+	body[11] = 0x04;		/* preamble: 4 octets */
+	body[12] = 0x05;		/* repeat count 5 */
+
+	/* Directed to our ONU-ID: learned and acknowledged. */
+	ds(f, ZXPON_DS_BURST_PROFILE, 7, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "directed profile accepted");
+	expect(take_type(&z, ZXPON_US_ACK, up), "directed profile acknowledged");
+
+	/* Broadcast: learned, never acknowledged. */
+	ds(f, ZXPON_DS_BURST_PROFILE, ZXPON_BCAST_ONUID, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "broadcast profile accepted");
+	expect(!take_type(&z, ZXPON_US_ACK, up),
+	       "broadcast profile not acknowledged");
+
+	/* Each reserved-bit field on its own must be ignored. */
+	body[2] = 0x14;			/* delimiter length + reserved high nibble */
+	ds(f, ZXPON_DS_BURST_PROFILE, 7, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "reserved delimiter bits ignored");
+	body[2] = 0x04;
+	body[11] = 0x24;
+	ds(f, ZXPON_DS_BURST_PROFILE, 7, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "reserved preamble bits ignored");
+	body[11] = 0x04;
+	body[12] = 0x25;		/* repeat 5 plus reserved bit 5 */
+	ds(f, ZXPON_DS_BURST_PROFILE, 7, body, sizeof(body));
+	expect(zxpon_rx_ploam(&z, f) == 0, "reserved repeat bits ignored");
+	expect(!take_type(&z, ZXPON_US_ACK, up),
+	       "malformed profile not acknowledged");
+	expect(zxpon_get_profile(&z, 2, &p) == 1 && p.delimiter_len == 4 &&
+	       p.preamble_repeat == 5,
+	       "learned profile untouched by malformed frames");
 }
 
 static void test_gem_and_mib(void)
@@ -276,6 +389,8 @@ int main(void)
 	test_los_from_o5();
 	test_to1();
 	test_disable();
+	test_profile();
+	test_profile_ack();
 	test_gem_and_mib();
 	test_vlan();
 	if (failed) {

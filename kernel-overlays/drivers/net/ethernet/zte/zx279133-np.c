@@ -1293,6 +1293,19 @@ static bool zx279133_soc_block_ok(u32 addr, u32 len)
 		{ 0x1a000000, 0x00800000 },	/* XPCS0 */
 		{ 0x1b000000, 0x00800000 },	/* XPCS1 */
 		{ 0x10e10000, 0x00000100 },	/* TOPCRM: PON PLL sel + gate/resets */
+		{ 0x10e20000, 0x00000100 },	/* pinctrl: pin mux/pinconf (i2c0 = p0-6/p0-7) */
+		{ 0x10d10000, 0x00000100 },	/* GPIO controllers 0-4 (P0..P4) */
+		/*
+		 * i2c0, at the address the vendor 4.19 tree gives it.  This is
+		 * already inside the MDIO0 window above (0x14f01000 + 0x4000
+		 * runs past 0x14f04000, which is wider than the 0x1000 the
+		 * device actually claims in /proc/iomem), so the entry is
+		 * documentation rather than a gate.  It is safe to read here
+		 * because this board boots with clk_ignore_unused, which leaves
+		 * i2cclk running; measured 2026-11-26, 0x14f03000 reads
+		 * 0x01020000 without faulting.
+		 */
+		{ 0x14f03000, 0x00000100 },	/* i2c0 controller (vendor dts) */
 	};
 	unsigned int i;
 

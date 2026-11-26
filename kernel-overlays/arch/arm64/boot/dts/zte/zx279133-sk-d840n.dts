@@ -242,11 +242,23 @@
 			 * NPPT owns opsd-gpio (the optical RX signal detect, gpio2 pin 1)
 			 * and publishes its state through an optional LED trigger. A user
 			 * selecting "none" must not be overridden by the polling worker.
+			 *
+			 * POLARITY IS ACTIVE_HIGH - do not "fix" it to ACTIVE_LOW.
+			 * Two independent proofs (2026-11-26):
+			 *   1. The vendor 4.19 device tree says led_los gpios = <gpio0 9 1>,
+			 *      flags 0x01 == GPIO_ACTIVE_HIGH (decompiled, leds_5).
+			 *   2. Measured on the panel: with ACTIVE_LOW in this file, logical
+			 *      brightness=1 drove the pin to physical low and the lamp went
+			 *      OUT. So physical high == lit, i.e. active high.
+			 * The red lamp is a loss-of-signal ALARM: lit = no light / RX_LOS,
+			 * dark = light present. That is also why the vendor default-state
+			 * is "off" and why zx279133_pon_led_work() drives LED_FULL only
+			 * when the RX detect says the fiber is dark.
 			 */
 			default-state = "on";
 			linux,default-trigger = "zx279133-los";
 			function = LED_FUNCTION_WAN;
-			gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
 			label = "skyworth:red:los";
 		};
 
@@ -436,12 +448,18 @@
 	/*
 	 * The panel's red LOS lamp follows the optical RX signal detect, not
 	 * the PON SerDes.  On this board the vendor's pon_plat puts the
-	 * optical RX_SD on gpio2 pin 1, and its PON thread treats a low level
-	 * as loss of signal. The NPPT driver polls it even when the LOS LED's
-	 * automatic trigger is disabled; optical detection is not a lamp setting.
-	 * see docs/91.
+	 * optical RX_SD on gpio2 pin 1.
+	 *
+	 * POLARITY MEASURED, NOT ASSUMED (2026-11-25, UX3361 with datas loaded):
+	 *   fiber plugged in : pin lo, A2[110] bit1 (RX_LOS) = 0, RX power -16.97 dBm
+	 *   fiber removed    : pin hi, A2[110] bit1 (RX_LOS) = 1, RX power 0
+	 * The pin therefore carries RX_LOS, active high = loss of light, i.e. the
+	 * logical "signal detect" is active low.  With ACTIVE_HIGH the driver saw
+	 * light present while the fiber was out and loss of signal while light was
+	 * actually arriving, which inverted both the red lamp and the PLOAM state
+	 * machine's LOS bit.
 	 */
-	opsd-gpios = <&gpio2 1 GPIO_ACTIVE_HIGH>;
+	opsd-gpios = <&gpio2 1 GPIO_ACTIVE_LOW>;
 	pcs-handle = <&xpcs1>;
 	/* The NP's own memory. Not a guess and not a leftover: in the one U-Boot session
 	 * that carried 11,471,728 bytes across this jack while this PC counted +469,482 of

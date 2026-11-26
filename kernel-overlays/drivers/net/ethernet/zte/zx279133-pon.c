@@ -34,6 +34,7 @@
 #include <linux/etherdevice.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/hex.h>
 #include <linux/if_arp.h>
 #include <linux/io.h>
 #include <linux/clk.h>
@@ -70,17 +71,19 @@ static struct led_trigger *zx_green;
 
 /*
  * This board's optical RX signal detect (opsd-gpio = gpio2 pin 1) is not
- * driven until the BOSA analogue front end is initialised.  In a mainline
- * boot that never happens, so pon_led_work() reads it low forever and calls
- * note_rxsd(0), which keeps z->los = 1.  Nothing in the real driver path
- * ever clears z->lods either.  Both bits gate zxpon_try_o23(), so a valid
- * identity cannot move the machine out of O1 even with a live OLT above.
+ * driven until the BOSA analogue front end is initialised.  On an untouched
+ * module the pin floats low; once the UX3361 MCU is loaded it drives the pin
+ * as RX_LOS (hi = dark fiber, lo = light present), which is why the binding
+ * is GPIO_ACTIVE_LOW.
  *
- * Once an identity is configured we arm the activation and stop letting a
- * low opsd kick us back to O1: send the serial number and let the PLOAM
- * state machine find out whether the OLT is really there (the standard
- * O1 timer still falls back if downstream frames never arrive).  The LED
- * still follows the raw GPIO, so the panel lamp remains honest.
+ * A mainline boot that never loads the BOSA datas therefore reads the pin as
+ * "light present", note_rxsd(1) clears z->los, and the PLOAM machine can try
+ * O2/O3 against a fiber that may not be there at all - the O1 timer falls
+ * back when downstream frames never arrive.
+ *
+ * Once an identity is configured we arm the activation and send the serial
+ * number, letting the PLOAM state machine find out whether the OLT is really
+ * above.  The LED still follows the raw GPIO, so the panel lamp stays honest.
  */
 static int zx_activation_armed;
 
@@ -181,6 +184,35 @@ static u8 zx_omci_log_dir[ZX_OMCI_LOG_N];
 static u32 zx_omci_log_head, zx_omci_log_n;
 static u32 zx_omci_rx_n, zx_omci_tx_n, zx_omci_drop_n;
 
+/*
+ * The same idea for the PLOAM channel, and here it is not a convenience.
+ * Message id 0x01 (Profile, G.987.3 11.3.3.1 - the GPON name
+ * Upstream_Overhead does not apply to XG-PON) is the only thing on the wire
+ * that says how an upstream burst has to be timed, and every field of it has
+ * to be read from a real OLT at least once.  A session with a fibre lasts
+ * minutes and nobody is watching at that moment, so the frames are kept
+ * instead: 32 deep covers a full O2-3 -> O4 -> O5 walk with room to spare, and
+ * the file is plain hex so it can be pasted straight back into
+ * "zxponctl ploam" for a replay on the bench with no fibre at all.
+ */
+#define ZX_PLOAM_LOG_N		32
+static u8 zx_ploam_log[ZX_PLOAM_LOG_N][ZXPON_PLOAM_LEN];
+static u8 zx_ploam_log_dir[ZX_PLOAM_LOG_N];
+static u32 zx_ploam_log_head, zx_ploam_log_n, zx_ploam_log_drop_n;
+
+/*
+ * Bench override for the optical signal detect.
+ *
+ * With no fibre the opsd GPIO reads dark, note_rxsd() keeps los == 1, and
+ * zxpon_rx_ploam() drops every frame before the state machine can see it.
+ * That is correct on a live line and useless on a desk: the whole
+ * O2-3 -> O4 -> O5 path stays untestable the moment the fibre is pulled.
+ * "light" asserts exactly the los == 0 a lit fibre produces, "dark" the
+ * opposite, "auto" hands control back to the GPIO.  It only moves the software
+ * flag, never the optic, so it cannot fake a working link by itself.
+ */
+static int zx_bench_light = -1;
+
 static struct zx_tcont_row zx_tcont_rows[ZX_TCONT_MAX];
 static struct zx_gem_row zx_gem_rows[ZX_GEM_MAX];
 static bool zx_provision_noted;
@@ -241,8 +273,28 @@ static void zx_pon_hw_bringup(void)
 	zx_xmac_rmw(0x16000, 0, 0x1f);
 	usleep_range(21000, 25000);
 	zx_xmac_rmw(0x1610b, 0, 0x80000);
-	/* Downstream disabled, but the two vendor config bits set. */
-	zx_xmac_rmw(0x16100, 0x1, 0x28);
+	/*
+	 * Downstream must be ON from the moment the MAC is armed, not from O5.
+	 * 0x16100 bit 0 is the downstream enable, and the OLT's broadcast
+	 * PLOAM (burst profile, message id 0x01) is what has to arrive on it
+	 * for O3/O4 to happen at all.
+	 *
+	 * What 2026-11-26 actually established, separated from what it did not:
+	 *   PROVEN   with bit 0 clear the register read 0x63a; with light on the
+	 *            fibre 0x16105 bit 4 (downstream lost) was set at 0x10.
+	 *   PROVEN   with bit 0 set 0x16100 reads 0x63b and, while the feed was
+	 *            live (-17.08..-17.21 dBm), 0x16105 read 0x02 - the same
+	 *            value the working HX5 reports at O5. Both were read back
+	 *            in the same boot (bosa_boot.log t=251/255/279 s).
+	 *   NOT LOGGED  "rx started climbing" was seen on the serial console but
+	 *            no capture file from that light-present boot survives. The
+	 *            surviving ploam_capture.log belongs to a different, dark
+	 *            boot (state=O1 throughout) and must NOT be used to argue
+	 *            either way. pon_rxwatch.sh exists to settle this on the
+	 *            next fibre insertion.
+	 * The vendor also sets the two config bits (0x28) here.
+	 */
+	zx_xmac_rmw(0x16100, 0, 0x29);
 	/* Vendor writes byte0=2 then byte1=0x0f here, which is exactly the
 	 * value this board's loader already leaves (0x0f02). */
 	val = (zx_xmac_r(0x16644) & ~0xffffu) | 0x0f02u;
@@ -292,8 +344,13 @@ static void zx_pon_hw_data(bool on)
 		zx_xmac_rmw(0x16600, 0x1, 0x2);
 		zx_xmac_rmw(0x16100, 0, 0x1);
 	} else {
+		/*
+		 * Only the upstream data half is closed here.  0x16100 bit 0
+		 * (downstream enable) stays set: leaving O5 must not blind the
+		 * receiver, or the OLT's next burst profile - the only thing
+		 * that can bring the ONU back - could never be heard again.
+		 */
 		zx_xmac_rmw(0x16600, 0x2, 0x1);
-		zx_xmac_rmw(0x16100, 0x1, 0);
 	}
 	zx_hw_data_on = on;
 }
@@ -330,14 +387,36 @@ static int zx_pon_hw_ploam_rx(u8 frame[ZXPON_PLOAM_LEN])
  */
 static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 {
+	static unsigned int stuck_ticks;
 	int i, ok = 0;
 
 	for (i = 0; i < 16; i++) {
 		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1))
 			break;
 	}
-	if (i == 16)
+	if (i == 16) {
+		/*
+		 * A kick that stays pending across many ticks is not waiting for
+		 * a grant, it is lost: the vendor hardware drops the completion
+		 * when the upstream window closes underneath it.  Leaving bit 0
+		 * set makes every later attempt fail before it even writes, so
+		 * the serial number would never be retried - and with it the
+		 * registration never happens.  Measured 2026-11-26: tx stopped
+		 * at 10, txerr went to 1, busy then climbed forever while the
+		 * state machine sat in O2-3.
+		 *
+		 * The tick is 100 ms (zx_tick), so 50 ticks is 5 s.  A real
+		 * upstream burst completes in well under a millisecond, so 5 s
+		 * cannot abort a transmission that was actually going to finish;
+		 * it only bounds how long one stuck kick can starve the retries.
+		 */
+		if (++stuck_ticks >= 50) {
+			zx_xmac_w(ZX_PON_TX_KICK, 0);
+			stuck_ticks = 0;
+		}
 		return -EBUSY;
+	}
+	stuck_ticks = 0;
 	for (i = 0; i < ZXPON_PLOAM_LEN / 4; i++) {
 		u32 word;
 
@@ -351,6 +430,10 @@ static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 			break;
 		}
 	}
+	/* Same reasoning from the other side: a kick issued here whose
+	 * completion never arrives would block every retry that follows. */
+	if (!ok)
+		zx_xmac_w(ZX_PON_TX_KICK, 0);
 	return ok ? 0 : -ETIMEDOUT;
 }
 
@@ -545,6 +628,35 @@ static void zx_omci_log_put(u8 dir, const u8 *frame)
 		zx_omci_log_n++;
 }
 
+/* 'R' = receiver, 'T' = transmitter, 'I' = injected from the bench.
+ *
+ * A live OLT repeats its broadcast messages several times a second, so storing
+ * every copy would fill the ring with one identical frame and bury the rare
+ * one - Assign_ONU_ID arrives once and matters most.  A frame already in the
+ * ring is therefore counted and dropped, which leaves 32 distinct frames.
+ */
+static void zx_ploam_log_put(u8 dir, const u8 *frame)
+{
+	u32 i;
+
+	for (i = 0; i < zx_ploam_log_n; i++) {
+		u32 slot = (zx_ploam_log_head + ZX_PLOAM_LOG_N - 1 - i) %
+			ZX_PLOAM_LOG_N;
+
+		if (!memcmp(zx_ploam_log[slot], frame, ZXPON_PLOAM_LEN)) {
+			zx_ploam_log_drop_n++;
+			return;
+		}
+	}
+	memcpy(zx_ploam_log[zx_ploam_log_head], frame, ZXPON_PLOAM_LEN);
+	zx_ploam_log_dir[zx_ploam_log_head] = dir;
+	zx_ploam_log_head = (zx_ploam_log_head + 1) % ZX_PLOAM_LOG_N;
+	if (zx_ploam_log_n < ZX_PLOAM_LOG_N)
+		zx_ploam_log_n++;
+	else
+		zx_ploam_log_drop_n++;
+}
+
 /*
  * Push every queued OMCI reply through the real IDM queue 0.  A failure stops
  * the drain instead of spinning: the frame that could not leave stays where
@@ -656,6 +768,7 @@ static void zxpon_poll_ploam(void)
 			break;
 		zx_ploam_rx_n++;
 		zx_last_rx_id = frame[2];
+		zx_ploam_log_put('R', frame);
 		zxpon_rx_ploam(&zx_state, frame);
 	}
 	for (i = 0; i < 4; i++) {
@@ -674,6 +787,7 @@ static void zxpon_poll_ploam(void)
 		}
 		zxpon_take_ploam(&zx_state, frame);
 		zx_ploam_tx_n++;
+		zx_ploam_log_put('T', frame);
 	}
 }
 
@@ -773,6 +887,38 @@ static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
 		alloc, alloc_ok);
 }
 static DEVICE_ATTR_RO(pon_hw);
+
+/* The OLT's burst profiles are the one input still missing from our upstream
+ * path.  Expose exactly what G.987.3 gives us so a live capture can be read
+ * without guessing a vendor register mapping. */
+static ssize_t pon_profile_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct zxpon_profile p;
+	char delim[32], pre[32], tag[32];
+	int i, n = 0;
+
+	for (i = 0; i < 4; i++) {
+		mutex_lock(&zx_pon_lock);
+		if (!zxpon_get_profile(&zx_state, i, &p)) {
+			mutex_unlock(&zx_pon_lock);
+			continue;
+		}
+		mutex_unlock(&zx_pon_lock);
+		hex_dump_to_buffer(p.delimiter, 8, 8, 1, delim, sizeof(delim), 0);
+		hex_dump_to_buffer(p.preamble, 8, 8, 1, pre, sizeof(pre), 0);
+		hex_dump_to_buffer(p.pon_tag, 8, 8, 1, tag, sizeof(tag), 0);
+		n += sysfs_emit_at(buf, n,
+			"idx=%u ver=%u fec=%u delim_len=%u pre_len=%u "
+			"pre_repeat=%u delim=%s pre=%s pon_tag=%s\n",
+			p.index, p.version, p.fec, p.delimiter_len,
+			p.preamble_len, p.preamble_repeat, delim, pre, tag);
+	}
+	if (!n)
+		n = sysfs_emit(buf, "no profiles learned\n");
+	return n;
+}
+static DEVICE_ATTR_RO(pon_profile);
 
 static bool zxpon_omci_channel(u16 *gem)
 {
@@ -1118,6 +1264,75 @@ static ssize_t pon_omci_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(pon_omci);
 
+/*
+ * Every PLOAM frame that crossed the hardware channel, oldest first.  Read it
+ * with a live fibre and it is a recording of what the OLT actually sends;
+ * feed the same lines back through "zxponctl ploam" and the whole O2-3 ->
+ * O4 -> O5 walk runs again with nothing plugged in.
+ */
+static ssize_t pon_ploam_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	static const char hex[] = "0123456789abcdef";
+	ssize_t len = 0;
+	u32 start, i, j;
+
+	mutex_lock(&zx_pon_lock);
+	len += sysfs_emit_at(buf, len,
+		"rx=%u tx=%u busy=%u txerr=%u last_id=%02x log=%u drop=%u\n",
+		zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_busy_n,
+		zx_ploam_txerr_n, zx_last_rx_id, zx_ploam_log_n,
+		zx_ploam_log_drop_n);
+	start = (zx_ploam_log_head + ZX_PLOAM_LOG_N - zx_ploam_log_n) %
+		ZX_PLOAM_LOG_N;
+	for (i = 0; i < zx_ploam_log_n && len < (int)PAGE_SIZE - 112; i++) {
+		u32 slot = (start + i) % ZX_PLOAM_LOG_N;
+
+		len += sysfs_emit_at(buf, len, "%c ", zx_ploam_log_dir[slot]);
+		for (j = 0; j < ZXPON_PLOAM_LEN; j++)
+			len += sysfs_emit_at(buf, len, "%c%c",
+				hex[zx_ploam_log[slot][j] >> 4],
+				hex[zx_ploam_log[slot][j] & 0xf]);
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+	mutex_unlock(&zx_pon_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(pon_ploam);
+
+static ssize_t pon_bench_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	if (zx_bench_light < 0)
+		return sysfs_emit(buf, "auto\n");
+	return sysfs_emit(buf, "%s\n", zx_bench_light ? "light" : "dark");
+}
+
+static ssize_t pon_bench_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	int v;
+
+	if (sysfs_streq(buf, "auto"))
+		v = -1;
+	else if (sysfs_streq(buf, "light"))
+		v = 1;
+	else if (sysfs_streq(buf, "dark"))
+		v = 0;
+	else
+		return -EINVAL;
+
+	zx_bench_light = v;
+	if (zx_alive && v >= 0) {
+		mutex_lock(&zx_pon_lock);
+		zxpon_set_los(&zx_state, v ? 0 : 1);
+		mutex_unlock(&zx_pon_lock);
+		zxpon_apply_carrier();
+	}
+	return count;
+}
+static DEVICE_ATTR_RW(pon_bench);
+
 static int zxpon_get_state(struct sk_buff *skb, struct genl_info *info)
 {
 	struct sk_buff *msg;
@@ -1293,6 +1508,7 @@ static int zxpon_ploam_rx_cmd(struct sk_buff *skb, struct genl_info *info)
 	       ZXPON_PLOAM_LEN);
 	zxpon_ploam_seal(frame);
 	mutex_lock(&zx_pon_lock);
+	zx_ploam_log_put('I', frame);
 	ret = zxpon_rx_ploam(&zx_state, frame);
 	mutex_unlock(&zx_pon_lock);
 	if (!noted) {
@@ -1457,12 +1673,20 @@ void zx279133_pon_note_rxsd(int light)
 	if (!zx_alive)
 		return;
 	mutex_lock(&zx_pon_lock);
-	/* A low opsd after activation is the uninitialised BOSA signal detect,
-	 * not proof of a dark fibre.  Ignore it so the PLOAM state machine is
-	 * not reset to O1 on every 200 ms poll.  A high opsd is always honoured.
+	if (zx_bench_light >= 0)
+		light = zx_bench_light;
+	/* opsd-gpios is bound GPIO_ACTIVE_LOW (measured: pin lo = light,
+	 * pin hi = RX_LOS), so gpiod already hands us the logical signal
+	 * detect and light == 1 means "frames can be received".
+	 *
+	 * Honour it unconditionally.  The old guard skipped light == 0 once
+	 * the activation was armed, because with the previous ACTIVE_HIGH
+	 * binding a dark fibre read as "lit" and would have kicked the PLOAM
+	 * machine back to O1 every 200 ms.  With the polarity correct that
+	 * guard would instead ignore a genuinely unplugged fiber, leaving a
+	 * stale los == 0 behind.
 	 */
-	if (light || !zx_activation_armed)
-		zxpon_set_los(&zx_state, light ? 0 : 1);
+	zxpon_set_los(&zx_state, light ? 0 : 1);
 	mutex_unlock(&zx_pon_lock);
 	zxpon_apply_carrier();
 }
@@ -1501,6 +1725,8 @@ void zx279133_pon_attach(struct net_device *ndev)
 		dev_warn(&ndev->dev, "omci_transport sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_hw))
 		dev_warn(&ndev->dev, "pon_hw sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_profile))
+		dev_warn(&ndev->dev, "pon_profile sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_tables))
 		dev_warn(&ndev->dev, "pon_tables sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_probe))
@@ -1511,6 +1737,10 @@ void zx279133_pon_attach(struct net_device *ndev)
 		dev_warn(&ndev->dev, "pon_reg sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_omci))
 		dev_warn(&ndev->dev, "pon_omci sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_ploam))
+		dev_warn(&ndev->dev, "pon_ploam sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_bench))
+		dev_warn(&ndev->dev, "pon_bench sysfs not created\n");
 	zx_omci = alloc_netdev(0, "omci", NET_NAME_UNKNOWN, zxpon_omci_setup);
 	if (zx_omci) {
 		zx_omci->dev.parent = ndev->dev.parent;
@@ -1554,11 +1784,14 @@ void zx279133_pon_stop(void)
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_state);
 		device_remove_file(&zx_wan->dev, &dev_attr_omci_transport);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_hw);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_profile);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_tables);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_probe);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_arm);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_reg);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_omci);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_ploam);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_bench);
 	}
 	zx_pon_hw = NULL;
 	zx_hw_data_on = 0;

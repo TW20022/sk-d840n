@@ -80,6 +80,25 @@ struct zxpon_me {
 	uint16_t vlan_tci;
 };
 
+/* G.987.3 11.3.3.1, message 0x01 'Profile'.  Up to four burst profiles are
+ * learned from periodic broadcast/unicast PLOAM messages; the BurstProfile
+ * field in each BWmap allocation selects one of them.  Nothing here is
+ * applied to the MAC registers yet: the register mapping is vendor-specific
+ * and has to be established against the real OLT frames first.
+ */
+struct zxpon_profile {
+	uint8_t valid;
+	uint8_t version;
+	uint8_t index;
+	uint8_t fec;
+	uint8_t delimiter_len;
+	uint8_t preamble_len;
+	uint8_t preamble_repeat;
+	uint8_t delimiter[8];
+	uint8_t preamble[8];
+	uint8_t pon_tag[8];
+};
+
 struct zxpon {
 	enum zxpon_state state;
 	uint8_t sn[ZXPON_SN_LEN];
@@ -106,6 +125,7 @@ struct zxpon {
 	int me_n;
 	uint8_t vlan_op;
 	uint16_t vlan_tci;
+	struct zxpon_profile profile[4];
 };
 
 void zxpon_init(struct zxpon *z);
@@ -126,6 +146,8 @@ int zxpon_ploam_pending(const struct zxpon *z);
 int zxpon_data_gem(const struct zxpon *z, uint16_t *gem);
 int zxpon_omcc_gem(const struct zxpon *z, uint16_t *gem);
 int zxpon_alloc_id(const struct zxpon *z, uint16_t *alloc);
+int zxpon_get_profile(const struct zxpon *z, unsigned index,
+		      struct zxpon_profile *out);
 int zxpon_map_gem(struct zxpon *z, uint16_t gem);
 int zxpon_add_tcont(struct zxpon *z, uint16_t alloc_id, int omcc, uint16_t gem);
 int zxpon_set_key(struct zxpon *z, const uint8_t key[ZXPON_KEY_LEN]);

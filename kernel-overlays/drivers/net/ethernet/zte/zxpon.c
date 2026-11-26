@@ -262,9 +262,25 @@ static void zxpon_drop_sn(struct zxpon *z)
 
 static void zxpon_enter_o1(struct zxpon *z, int drop_sn)
 {
+	/* Every resource handed out by the OLT is only valid for the current
+	 * registration.  Keeping them across a LOS/LODS-driven fall back to O1
+	 * makes pon_hw report a stale AllocID and lets a later registration
+	 * look "already configured" when it is not.  The serial-number queue
+	 * is handled separately (drop_sn) because a fresh O2-3 always re-arms
+	 * it anyway.
+	 */
 	z->state = ZXPON_O1;
 	z->to1_ms = 0;
 	z->to2_ms = 0;
+	z->onu_id = 0;
+	z->alloc_id = 0;
+	z->alloc_valid = 0;
+	z->omcc_gem = 0;
+	z->omcc_valid = 0;
+	z->data_gem = 0;
+	z->data_valid = 0;
+	/* G.987.3 12.2.2: burst profiles do not survive activation. */
+	memset(z->profile, 0, sizeof(z->profile));
 	if (drop_sn)
 		zxpon_drop_sn(z);
 }
@@ -410,8 +426,38 @@ int zxpon_rx_ploam(struct zxpon *z, const uint8_t frame[48])
 		return 0;
 
 	switch (id) {
-	case ZXPON_DS_BURST_PROFILE:
+	case ZXPON_DS_BURST_PROFILE: {
+		/* G.987.3 11.3.3.1: c[] starts at octet 5.
+		 *   c[0]  VVVV00PP : version nibble + 2-bit profile index
+		 *   c[1]  FEC enable in bit 0
+		 *   c[2]  delimiter length (low nibble, octets)
+		 *   c[3..10]  delimiter pattern
+		 *   c[11] preamble length (low nibble, octets)
+		 *   c[12] preamble repeat count (low 5 bits)
+		 *   c[13..20] preamble pattern
+		 *   c[21..28] PON-TAG (binds the master session key)
+		 */
+		struct zxpon_profile *p;
+
+		if ((c[0] & 0x0c) || c[2] & 0xf0 || c[11] & 0xf0 ||
+		    c[12] & 0xe0)
+			return 0;	/* reserved bits set: not a valid profile */
+		p = &z->profile[c[0] & 3];
+		p->valid = 1;
+		p->version = c[0] >> 4;
+		p->index = c[0] & 3;
+		p->fec = c[1] & 1;
+		p->delimiter_len = c[2] & 0xf;
+		p->preamble_len = c[11] & 0xf;
+		p->preamble_repeat = c[12] & 0x1f;
+		memcpy(p->delimiter, c + 3, 8);
+		memcpy(p->preamble, c + 13, 8);
+		memcpy(p->pon_tag, c + 21, 8);
+		/* A directed Profile in O5 is the one frame that needs an ACK. */
+		if (z->state == ZXPON_O5 && onu != ZXPON_BCAST_ONUID)
+			zxpon_queue_ploam(z, ZXPON_US_ACK, z->onu_id, &id, 1);
 		return 0;
+	}
 	case ZXPON_DS_ASSIGN_ONUID:
 		if (z->state != ZXPON_O23)
 			return 0;
@@ -764,6 +810,15 @@ int zxpon_alloc_id(const struct zxpon *z, uint16_t *alloc)
 	if (!z->alloc_valid)
 		return 0;
 	*alloc = z->alloc_id;
+	return 1;
+}
+
+int zxpon_get_profile(const struct zxpon *z, unsigned index,
+		      struct zxpon_profile *out)
+{
+	if (index >= 4 || !z->profile[index].valid)
+		return 0;
+	*out = z->profile[index];
 	return 1;
 }
 
