@@ -117,6 +117,7 @@ struct zxpon {
 	int data_valid;
 	uint8_t key[ZXPON_KEY_LEN];
 	int key_valid;
+	uint32_t mic_bad_n;	/* broadcast frames whose MIC we could not check */
 	uint8_t ploam_tx[ZXPON_PLOAM_Q][ZXPON_PLOAM_LEN];
 	int ploam_tx_n;
 	uint8_t omci_tx[ZXPON_OMCI_Q][ZXPON_OMCI_LEN];

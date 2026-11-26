@@ -385,38 +385,36 @@ static int zx_pon_hw_ploam_rx(u8 frame[ZXPON_PLOAM_LEN])
  * window that is still busy is reported as -EBUSY and the queued frame stays
  * where it is, to be retried on a later tick.
  */
+/*
+ * Upstream PLOAM transmission is a request, not a register write that
+ * completes on its own.  Writing TX_DATA and setting TX_KICK hands the burst
+ * to the MAC; the MAC then waits for the OLT to open a grant window for it.
+ * That window can be a whole superframe away, and for an unregistered ONU it
+ * is the only thing that makes the burst possible at all.
+ *
+ * Polling the bit a few times inside the same call and clearing it on failure
+ * therefore cancels the burst before it can ever be sent.  Measured on a live
+ * line on 2026-11-26: tx froze at 10 while txerr climbed by one per tick, the
+ * OLT kept broadcasting burst profiles and never once addressed our ONU-ID -
+ * it had never seen a serial number, because every one of them was withdrawn
+ * microseconds after it was requested.
+ *
+ * So kick and return.  zx_pon_hw_tx_reap() watches the bit on later ticks and
+ * counts the burst when the MAC clears it.  The bit is only cleared here once
+ * the MAC has evidently dropped it; the vendor's own completion path is an
+ * interrupt, and five seconds is many thousand superframes.
+ */
+#define ZX_TX_REAP_TICKS 50	/* 5 s at the 100 ms tick */
+
+static int zx_tx_inflight;
+static unsigned int zx_tx_wait_ticks;
+
 static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 {
-	static unsigned int stuck_ticks;
-	int i, ok = 0;
+	int i;
 
-	for (i = 0; i < 16; i++) {
-		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1))
-			break;
-	}
-	if (i == 16) {
-		/*
-		 * A kick that stays pending across many ticks is not waiting for
-		 * a grant, it is lost: the vendor hardware drops the completion
-		 * when the upstream window closes underneath it.  Leaving bit 0
-		 * set makes every later attempt fail before it even writes, so
-		 * the serial number would never be retried - and with it the
-		 * registration never happens.  Measured 2026-11-26: tx stopped
-		 * at 10, txerr went to 1, busy then climbed forever while the
-		 * state machine sat in O2-3.
-		 *
-		 * The tick is 100 ms (zx_tick), so 50 ticks is 5 s.  A real
-		 * upstream burst completes in well under a millisecond, so 5 s
-		 * cannot abort a transmission that was actually going to finish;
-		 * it only bounds how long one stuck kick can starve the retries.
-		 */
-		if (++stuck_ticks >= 50) {
-			zx_xmac_w(ZX_PON_TX_KICK, 0);
-			stuck_ticks = 0;
-		}
-		return -EBUSY;
-	}
-	stuck_ticks = 0;
+	if (zx_xmac_r(ZX_PON_TX_KICK) & 1)
+		return -EBUSY;		/* previous burst still waiting */
 	for (i = 0; i < ZXPON_PLOAM_LEN / 4; i++) {
 		u32 word;
 
@@ -424,17 +422,26 @@ static int zx_pon_hw_ploam_tx(const u8 frame[ZXPON_PLOAM_LEN])
 		zx_xmac_w(ZX_PON_TX_DATA + i, __swab32(word));
 	}
 	zx_xmac_w(ZX_PON_TX_KICK, 1);
-	for (i = 0; i < 16; i++) {
-		if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1)) {
-			ok = 1;
-			break;
-		}
+	zx_tx_inflight = 1;
+	zx_tx_wait_ticks = 0;
+	return 0;
+}
+
+/* Did the burst we kicked last time actually leave?  Called once per tick. */
+static void zx_pon_hw_tx_reap(void)
+{
+	if (!zx_tx_inflight || !zx_pon_hw)
+		return;
+	if (!(zx_xmac_r(ZX_PON_TX_KICK) & 1)) {
+		zx_tx_inflight = 0;
+		zx_ploam_tx_n++;	/* the MAC took it out on a grant */
+		return;
 	}
-	/* Same reasoning from the other side: a kick issued here whose
-	 * completion never arrives would block every retry that follows. */
-	if (!ok)
+	if (++zx_tx_wait_ticks >= ZX_TX_REAP_TICKS) {
 		zx_xmac_w(ZX_PON_TX_KICK, 0);
-	return ok ? 0 : -ETIMEDOUT;
+		zx_tx_inflight = 0;
+		zx_ploam_txerr_n++;
+	}
 }
 
 /*
@@ -763,6 +770,7 @@ static void zxpon_poll_ploam(void)
 
 	if (!zx_pon_hw)
 		return;
+	zx_pon_hw_tx_reap();
 	for (i = 0; i < 4; i++) {
 		if (!zx_pon_hw_ploam_rx(frame))
 			break;
@@ -778,7 +786,7 @@ static void zxpon_poll_ploam(void)
 			break;
 		ret = zx_pon_hw_ploam_tx(frame);
 		if (ret) {
-			/* -EBUSY with no fibre is the normal state, not a fault. */
+			/* -EBUSY between bursts is the normal state, not a fault. */
 			if (ret == -EBUSY)
 				zx_ploam_busy_n++;
 			else
@@ -786,7 +794,6 @@ static void zxpon_poll_ploam(void)
 			break;
 		}
 		zxpon_take_ploam(&zx_state, frame);
-		zx_ploam_tx_n++;
 		zx_ploam_log_put('T', frame);
 	}
 }
@@ -879,12 +886,12 @@ static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
 	mutex_unlock(&zx_pon_lock);
 	return sysfs_emit(buf,
 		"mapped=%u rx_pending=%08x tx_kick=%08x "
-		"rx=%u tx=%u txerr=%u busy=%u last_rx_id=%02x data=%u "
+		"rx=%u tx=%u txerr=%u busy=%u last_rx_id=%02x data=%u micbad=%u "
 		"alloc=%04x alloc_valid=%u\n",
 		zx_pon_hw ? 1 : 0, zx_xmac_r(ZX_PON_RX_PENDING),
 		zx_xmac_r(ZX_PON_TX_KICK), zx_ploam_rx_n, zx_ploam_tx_n,
 		zx_ploam_txerr_n, zx_ploam_busy_n, zx_last_rx_id, zx_hw_data_on,
-		alloc, alloc_ok);
+		zx_state.mic_bad_n, alloc, alloc_ok);
 }
 static DEVICE_ATTR_RO(pon_hw);
 

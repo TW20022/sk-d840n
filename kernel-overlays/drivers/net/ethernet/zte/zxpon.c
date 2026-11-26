@@ -414,8 +414,25 @@ int zxpon_rx_ploam(struct zxpon *z, const uint8_t frame[48])
 	uint8_t id;
 	const uint8_t *c;
 
-	if (!zxpon_ploam_mic_ok(frame))
-		return -1;
+	/*
+	 * A broadcast frame cannot be authenticated before registration.  The
+	 * OLT stamps this field with a key the ONU does not hold yet, so no
+	 * guess reproduces it: checked against two real 0x01 frames from the
+	 * Huawei OLT on 2026-11-26, CMAC with the default key over every
+	 * prefix of the message and every truncation of the result matches
+	 * nothing in the trailing eight octets.
+	 *
+	 * Rejecting those frames is what kept the board parked in O2-3 with
+	 * 152 frames received and not one profile learned.  Accept broadcast,
+	 * count the mismatch, and keep the strict check for directed
+	 * messages - those are addressed to our ONU-ID and we do have a key
+	 * by the time they arrive.
+	 */
+	if (!zxpon_ploam_mic_ok(frame)) {
+		z->mic_bad_n++;
+		if (zxpon_be16(frame) != ZXPON_BCAST_ONUID)
+			return -1;
+	}
 	if (z->los)
 		return 0;
 	onu = zxpon_be16(frame);
