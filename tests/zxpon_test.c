@@ -27,7 +27,7 @@ static void ds(uint8_t f[48], uint8_t id, unsigned onu,
 	f[2] = id;
 	if (c && n)
 		memcpy(f + 4, c, n);
-	zxpon_ploam_seal(f);
+	zxpon_ploam_seal_dir(f, ZXPON_MIC_DS);
 }
 
 static void omci(uint8_t f[48], uint8_t mt, unsigned class_id, unsigned inst,
@@ -63,7 +63,8 @@ static int take_type(struct zxpon *z, uint8_t want, uint8_t out[48])
 	for (i = 0; i < 8; i++) {
 		if (!zxpon_take_ploam(z, out))
 			return 0;
-		expect(zxpon_ploam_mic_ok(out), "upstream MIC");
+		expect(zxpon_ploam_mic_ok_dir(out, ZXPON_MIC_US),
+		       "upstream MIC");
 		if (out[2] == want)
 			return 1;
 	}
@@ -383,9 +384,40 @@ static void test_cmac_and_crc(void)
 	       "CRC-32");
 }
 
+/* The vendor prefixes the CMAC message with a direction octet.  Getting
+ * this wrong produces a perfectly framed SN that the OLT silently drops. */
+static void test_mic_direction(void)
+{
+	uint8_t f[48], down[48], key[16], msg[41], mac[16];
+	int i;
+
+	memset(f, 0, sizeof(f));
+	put16(f, ZXPON_BCAST_ONUID);
+	f[2] = ZXPON_US_SERIAL_NUMBER;
+	memcpy(f + 4, "CMDC\xa1\x33\xe3\x48", 8);
+
+	memset(key, 0x55, sizeof(key));
+	msg[0] = ZXPON_MIC_US;
+	memcpy(msg + 1, f, 40);
+	zxpon_cmac(key, msg, sizeof(msg), mac);
+	zxpon_ploam_seal(f);
+	expect(memcmp(mac, f + 40, 8) == 0, "upstream MIC has direction 02");
+
+	memcpy(down, f, sizeof(f));
+	msg[0] = ZXPON_MIC_DS;
+	zxpon_cmac(key, msg, sizeof(msg), mac);
+	expect(memcmp(mac, down + 40, 8) != 0, "direction changes the MIC");
+	zxpon_ploam_seal_dir(down, ZXPON_MIC_DS);
+	expect(zxpon_ploam_mic_ok(down), "downstream MIC roundtrip");
+	expect(!zxpon_ploam_mic_ok(f), "upstream MIC is not downstream");
+	for (i = 0; i < 8; i++)
+		expect(f[40 + i] != down[40 + i], "MIC bytes differ");
+}
+
 int main(void)
 {
 	test_cmac_and_crc();
+	test_mic_direction();
 	test_los_from_o5();
 	test_to1();
 	test_disable();

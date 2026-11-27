@@ -152,6 +152,10 @@ int zxpon_get_profile(const struct zxpon *z, unsigned index,
 int zxpon_map_gem(struct zxpon *z, uint16_t gem);
 int zxpon_add_tcont(struct zxpon *z, uint16_t alloc_id, int omcc, uint16_t gem);
 int zxpon_set_key(struct zxpon *z, const uint8_t key[ZXPON_KEY_LEN]);
+#define ZXPON_MIC_DS	0x01
+#define ZXPON_MIC_US	0x02
+void zxpon_ploam_seal_dir(uint8_t frame[ZXPON_PLOAM_LEN], uint8_t dir);
+int zxpon_ploam_mic_ok_dir(const uint8_t frame[ZXPON_PLOAM_LEN], uint8_t dir);
 void zxpon_ploam_seal(uint8_t frame[ZXPON_PLOAM_LEN]);
 int zxpon_ploam_mic_ok(const uint8_t frame[ZXPON_PLOAM_LEN]);
 void zxpon_cmac(const uint8_t key[ZXPON_KEY_LEN], const uint8_t *msg,

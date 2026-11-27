@@ -38,8 +38,14 @@
 #include <linux/if_arp.h>
 #include <linux/io.h>
 #include <linux/clk.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio.h>
+#include <linux/i2c.h>
+#include <linux/i2c-algo-bit.h>
 #include <linux/leds.h>
 #include <linux/ioport.h>
+#include <linux/jiffies.h>
+#include <linux/random.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/swab.h>
@@ -174,6 +180,31 @@ static u8 zx_last_rx_id;
 static int zx_hw_data_on;
 
 /*
+ * Per-message counters for the only downstream messages that mark a step
+ * forward.  npu.ko's own PON status block keeps the same two (key_ctrl_rx,
+ * key_report_tx) alongside the serial-number counters, and for a good reason:
+ * once the OLT has assigned an ONU-ID, whether it followed up with Key
+ * Control is the difference between "registered" and "registered and
+ * provisioned".  Counting the IDs where the frames actually arrive keeps the
+ * number honest even when the state machine rejects the frame (wrong MIC,
+ * wrong ONU-ID) - the raw histogram in pon_rxraw shows the same thing, but a
+ * single counter is what a one-line verdict can use.
+ */
+static u32 zx_ploam_assign_n;		/* DS 0x03 Assign_ONU-ID seen */
+static u32 zx_ploam_key_ctrl_n;		/* DS 0x0d Key Control seen */
+static u32 zx_ploam_key_rep_n;		/* US 0x05 Key Report handed to MAC */
+static u32 zx_ploam_regid_n;		/* US 0x02 Registration handed to MAC */
+
+/*
+ * Every downstream PLOAM frame the state machine was handed, from either
+ * source: the MAC receive ring or the bench injection verb.  zx_ploam_rx_n
+ * counts only the former, so a stage verdict built on it would read
+ * "no_downstream_ploam" while a rehearsal was happily learning profiles -
+ * which is exactly what happened the first time this file was exercised.
+ */
+static u32 zx_ploam_ds_n;
+
+/*
  * Management channel counters and a small ring of the frames that crossed it.
  * The ring is what makes the bench able to check a reply byte by byte without
  * attaching a socket to the management netdev.
@@ -199,6 +230,34 @@ static u32 zx_omci_rx_n, zx_omci_tx_n, zx_omci_drop_n;
 static u8 zx_ploam_log[ZX_PLOAM_LOG_N][ZXPON_PLOAM_LEN];
 static u8 zx_ploam_log_dir[ZX_PLOAM_LOG_N];
 static u32 zx_ploam_log_head, zx_ploam_log_n, zx_ploam_log_drop_n;
+
+/*
+ * Raw downstream message-ID histogram, taken at the hardware RX ring before
+ * MIC verification and zxpon_for_us() filtering.  pon_ploam only shows frames
+ * that passed the CMAC check, so a Serial-Number Request arriving on a
+ * different key would be invisible there.  This counter cannot lie about it.
+ */
+static u32 zx_rx_raw_id_hist[256];
+static u8 zx_rx_raw_last[256][8];
+
+/*
+ * Bookkeeping for one downstream frame, whatever brought it in.  Both the MAC
+ * receive loop and the bench injection verb call this, so the counters and
+ * the raw histogram mean the same thing in a rehearsal and on a live fibre.
+ * The first cut of pon_stage counted inside the receive loop only and then
+ * reported "no Assign_ONU-ID" while the state machine was already in O5.
+ */
+static void zx_ploam_note_ds(const u8 *frame)
+{
+	zx_ploam_ds_n++;
+	zx_last_rx_id = frame[2];
+	zx_rx_raw_id_hist[frame[2]]++;
+	if (frame[2] == ZXPON_DS_ASSIGN_ONUID)
+		zx_ploam_assign_n++;
+	else if (frame[2] == ZXPON_DS_KEY_CONTROL)
+		zx_ploam_key_ctrl_n++;
+	memcpy(zx_rx_raw_last[frame[2]], frame, 8);
+}
 
 /*
  * Bench override for the optical signal detect.
@@ -259,7 +318,15 @@ static void zx_pon_hw_bringup(void)
 	if (!zx_pon_hw)
 		return;
 
-	/* XG-PON (mode 3): mode nibble, preamble repeats, preamble pattern. */
+	/* XG-PON: mode nibble, preamble repeats, preamble pattern.
+	 *
+	 * History: we briefly tried forcing the mode nibble to 3 by writing
+	 * 0x16006 (the vendor passes index 6 to Hal_WriteXmacReg, which could
+	 * arguably alias 0x16006).  Measured on a working HX5-9saLite at O5
+	 * on the same fibre: 0x16006 reads 0x12, i.e. the mode nibble is 2,
+	 * not 3.  Forcing 3 is therefore wrong and has been reverted; only
+	 * the legacy index-6 write stays, exactly as the vendor brings the
+	 * block up. */
 	zx_xmac_rmw(0x6, 0xf, 3);
 	zx_xmac_w(0x1688e, 0x20);
 	val = (zx_xmac_r(0x1611d) & ~0x3ffu) | 0x3ffu | 0xffc00u;
@@ -299,8 +366,29 @@ static void zx_pon_hw_bringup(void)
 	 * value this board's loader already leaves (0x0f02). */
 	val = (zx_xmac_r(0x16644) & ~0xffffu) | 0x0f02u;
 	zx_xmac_w(0x16644, val);
-	/* Upstream PLOAM path enabled, normal data upstream held off. */
-	zx_xmac_rmw(0x16600, 0x2 | 0x8, 0x11);
+	/* Upstream mode: REGISTRATION, not data.
+	 *
+	 * fi_Configure_Ponmac_Set_Upstream_Enable() has two modes:
+	 *   arg 0 -> clear bit1, set bit0     (PLOAM/registration uplink)
+	 *   arg 1 -> set bit1, clear bit0/3   (user data uplink)
+	 * and states 0x15 / 0x16 respectively once bit2+bit4 are set.
+	 *
+	 * Measured today on a working HX5-9saLite on the same fibre:
+	 *   O1 / O2-3 (unregistered): 0x16600 = 0x15
+	 *   O4 / O5   (registered):   0x16600 = 0x16
+	 * This driver used to write the arg-1 (data) word right here in
+	 * Hw_Init, so bit0 - the PLOAM uplink enable - was never set during
+	 * registration.  That is why the serial number latch 0x16611 bit0
+	 * stayed pending for ever and bit1 (hardware "a burst really went
+	 * out") never latched: the MAC had no uplink to put a burst in.
+	 *
+	 * bit4 (0x10) is part of both words - Hw_Init sets it and HX5 keeps
+	 * it in every state - so it is set here as well.
+	 */
+	zx_xmac_rmw(0x16600, 0x2, 0x1 | 0x10);
+	/* fi_power_init() also sets 0x1666f bit0; HX5 reads 0x1 here for the
+	 * whole session, this board read 0x0. */
+	zx_xmac_rmw(0x1666f, 0, 0x1);
 	zx_xmac_rmw(0x1689f, 0, 0x1);
 	zx_xmac_rmw(0x1a, 0xc, 0);
 	zx_xmac_rmw(0x16001, 0, 0x1);
@@ -333,6 +421,312 @@ static void zx_pon_hw_set_sn(const u8 sn[ZXPON_SN_LEN])
 	memcpy(&hi, sn + sizeof(lo), sizeof(hi));
 	zx_xmac_w(0x16636, __swab32(lo));
 	zx_xmac_w(0x16637, __swab32(hi));
+}
+
+/*
+ * The vendor activation state machine keeps a hardware shadow of the software
+ * state in 0x16500: low five bits are the O-state (O2-3 is 3), bits 16..25
+ * the current ONU-ID.  Our board left that word at 0x03ff0000 for the whole
+ * registration attempt, even though the software was in O2-3, and the MAC
+ * never consumed an upstream grant.  Writing the same shadow the vendor
+ * writes, together with its Alloc-ID 0x3fe and the default profile control
+ * word, made the very first correctly addressed serial number leave the MAC.
+ */
+static int zx_hw_state_applied = -1;
+static u32 zx_prof_hash;
+
+static u32 zx_prof_mix(u32 h, u32 v)
+{
+	h ^= v;
+	return h * 16777619u;
+}
+
+static u32 zx_profiles_hash(void)
+{
+	u32 h = 2166136261u;
+	int i, j;
+
+	for (i = 0; i < 4; i++) {
+		const struct zxpon_profile *p = &zx_state.profile[i];
+
+		h = zx_prof_mix(h, p->valid);
+		if (!p->valid)
+			continue;
+		h = zx_prof_mix(h, p->version);
+		h = zx_prof_mix(h, p->fec);
+		h = zx_prof_mix(h, p->delimiter_len);
+		h = zx_prof_mix(h, p->preamble_len);
+		h = zx_prof_mix(h, p->preamble_repeat);
+		for (j = 0; j < 8; j++) {
+			h = zx_prof_mix(h, p->delimiter[j]);
+			h = zx_prof_mix(h, p->preamble[j]);
+		}
+	}
+	return h;
+}
+
+/* fi_Configure_Ponmac_Set_Profile(): the four words are byte-swapped. */
+static void zx_pon_hw_put_bytes(u32 reg, const u8 *b)
+{
+	u32 v;
+
+	memcpy(&v, b, 4);
+	zx_xmac_w(reg, __swab32(v));
+}
+
+static void zx_pon_hw_apply_profiles_locked(void)
+{
+	u32 h = zx_profiles_hash(), bits = 0, pre_len = 0;
+	int i;
+
+	if (!zx_pon_hw || h == zx_prof_hash)
+		return;
+	zx_prof_hash = h;
+	for (i = 0; i < 4; i++) {
+		const struct zxpon_profile *p = &zx_state.profile[i];
+		u32 ctrl;
+
+		if (!p->valid)
+			continue;
+		/* Vendor: preamble_len | delimiter_len<<8 | repeat<<16. */
+		ctrl = (p->preamble_len & 0xf) |
+		       ((p->delimiter_len & 0xf) << 8) |
+		       ((p->preamble_repeat & 0x1f) << 16);
+		zx_xmac_w(0x16620 + 5 * i, ctrl);
+		zx_pon_hw_put_bytes(0x16621 + 5 * i, p->preamble);
+		zx_pon_hw_put_bytes(0x16622 + 5 * i, p->preamble + 4);
+		zx_pon_hw_put_bytes(0x16623 + 5 * i, p->delimiter);
+		zx_pon_hw_put_bytes(0x16624 + 5 * i, p->delimiter + 4);
+		/* Valid bit at 2*i, FEC bit at 2*i+1 in byte 0 of 0x1650a. */
+		bits |= 1u << (2 * i);
+		if (p->fec)
+			bits |= 1u << (2 * i + 1);
+		pre_len = p->preamble_len & 0xf;
+	}
+	/* Byte 1 low nibble is the preamble length of the last profile. */
+	zx_xmac_rmw(0x1650a, 0xffff, bits | (pre_len << 8));
+}
+
+static int zx_vendor_state(int s)
+{
+	switch (s) {
+	case ZXPON_O1:	return 1;
+	case ZXPON_O23:	return 3;
+	case ZXPON_O4:	return 4;
+	case ZXPON_O5:	return 5;
+	case ZXPON_O6:	return 6;
+	case ZXPON_O7:	return 7;
+	default:	return 0;
+	}
+}
+
+/*
+ * 0x16600 upstream enable, re-asserted on every tick.
+ *
+ * Measured on this board: the MAC zeroes 0x16600 by itself the moment the
+ * downstream locks and the ONU moves into O2-3.  The persisted monitor log
+ * caught exactly that - one O2-3 sample read
+ *
+ *     st=O2-3 ... 16600=00000000 16500=00000003 sn_kick=0
+ *
+ * while the state was already correct.  This driver used to program this
+ * register only when the PON state *changed*, so that single write landed
+ * before the MAC cleared it and nothing ever restored it: the PLOAM uplink
+ * stayed dead for the whole registration attempt.
+ *
+ * HX5-9saLite on the same fibre reads 0x15 in O1/O2-3 and 0x16 in O5, so
+ * the whole byte is determined by the state:
+ *     0x15 = bit0 (PLOAM uplink) | bit2 | bit4
+ *     0x16 = bit1 (data uplink)  | bit2 | bit4
+ * Only write when the live value differs, since this runs every 100 ms.
+ */
+static u32 zx_up_fix_n;
+
+static void zx_pon_hw_upstream_ensure(int s)
+{
+	u32 cur, mask, set;
+
+	if (!zx_pon_hw)
+		return;
+	cur = zx_xmac_r(0x16600);
+	if (s == ZXPON_O5 || s == ZXPON_O6) {
+		if ((cur & 0x1f) == 0x16)
+			return;
+		mask = 0x1 | 0x8;
+		set  = 0x2 | 0x4 | 0x10;
+	} else {
+		if ((cur & 0x1f) == 0x15)
+			return;
+		mask = 0x2 | 0x8;
+		set  = 0x1 | 0x4 | 0x10;
+	}
+	zx_xmac_rmw(0x16600, mask, set);
+	zx_up_fix_n++;
+}
+
+static void zx_pon_hw_apply_state_locked(void)
+{
+	int s = zxpon_state(&zx_state);
+	u32 onu, aid, val;
+
+	zx_pon_hw_apply_profiles_locked();
+	if (!zx_pon_hw)
+		return;
+	/* Before the "state unchanged" early-out on purpose: the MAC can
+	 * clear the upstream word without the PON state moving at all. */
+	zx_pon_hw_upstream_ensure(s);
+	if (s == zx_hw_state_applied)
+		return;
+	zx_hw_state_applied = s;
+
+	onu = zx_state.onu_id & 0x3ff;
+	zx_xmac_rmw(0x16500, 0x03ff001f, (onu << 16) | zx_vendor_state(s));
+
+	if (s == ZXPON_O4 || s == ZXPON_O5 || s == ZXPON_O6)
+		zx_xmac_w(0x1650f, (zx_state.onu_id & 0x3fff) | 0x4000);
+	else
+		zx_xmac_w(0x1650f, 0);
+
+	/*
+	 * fi_Configure_SN_AllocId_Set(), decoded from zte_xgpon.ko at 0x7aac
+	 * (the g_up_mode == 0x40 branch; the 0x80 branch above it is XGS):
+	 *
+	 *     addr = 0x16000 + 0x50f + (cputype == 5 ? 0x20 : 0x1e)
+	 *     half = read(addr) & ~0x3fff | 0x3ff ; half |= valid << 14
+	 *     write(addr, half)
+	 *
+	 * Two things here differed from what this driver used to do, and both
+	 * stopped the MAC from ever recognising the OLT's serial-number grant:
+	 *
+	 *   - the broadcast Alloc-ID for an unregistered ONU is 0x3ff, not
+	 *     0x3fe (0x3fe is the XGS-PON value in the other branch);
+	 *   - the entry needs the valid bit, and the vendor writes exactly one
+	 *     word - 0x1652d on this SoC - never the 0x1651f/0x1652e pair.
+	 *
+	 * Measured before this fix: latch 0x16611 stuck at 1, tx=0, sn_kick
+	 * climbing with sn_done frozen at 0 for minutes on a live fibre.
+	 */
+	if (s == ZXPON_O5 || s == ZXPON_O6) {
+		aid = zx_state.alloc_valid ? (zx_state.alloc_id & 0x3fff) : 0x3ff;
+		val = (aid << 16) | 0x40000000u;
+		zx_xmac_rmw(0x1652d, 0x7fff0000, val);
+		zx_xmac_rmw(0x16520, 0x7fff0000, val);
+	} else if (s == ZXPON_O23 || s == ZXPON_O4) {
+		/* 0x43ff = valid (0x4000) | broadcast Alloc-ID 0x3ff.
+		 * Only 0x1652d: the vendor writes that single word, and a
+		 * working HX5 reads 0x0 at 0x1651f while unregistered. */
+		zx_xmac_rmw(0x1652d, 0x7fff0000, 0x43ff0000u);
+	}
+
+	/* 0x16600 is handled by zx_pon_hw_upstream_ensure() above, which runs
+	 * every tick instead of only on a state change - see the comment there
+	 * for why a one-shot write is not enough. */
+}
+
+static int zx_profiles_valid(void)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		if (zx_state.profile[i].valid)
+			return 1;
+	return 0;
+}
+
+/*
+ * The serial-number answer is not a normal PLOAM kick.  The vendor's
+ * setSnMIC() writes the CMAC into 0x1663e/f and then sets 0x16611 bit 0;
+ * the SN octets themselves live in 0x16636/7, written when the identity
+ * was installed.  Kicking 0x16642 with a hand-built SN frame made the MAC
+ * wait forever for a grant that never came, while the real path left once
+ * as soon as these dedicated registers were filled.  It is only armed
+ * after a Profile frame, exactly as p_o2_3_profile_msg() does it.
+ */
+static u32 zx_sn_kick_n, zx_sn_rearm_n, zx_sn_done_n, zx_sn_noprof_n;
+static int zx_sn_armed, zx_sn_hw_sent;
+
+/*
+ * fi_Configure_Ponmac_Set_Random_Delay() in the vendor module mixes
+ * get_random_bytes() with jiffies and two XMAC registers and reduces the
+ * result modulo 0x1d28f before writing it to 0x16503.  The ONU uses that
+ * value to place its serial-number burst at a random offset inside the
+ * OLT's registration grant, so two ONUs powering up together do not
+ * collide.
+ */
+static u32 zx_sn_rand_delay(void)
+{
+	u32 r = get_random_u32();
+
+	r ^= (u32)jiffies;
+	r ^= zx_xmac_r(0x16637);
+	r ^= zx_xmac_r(0x16521);
+	return r % 0x1d28fu;
+}
+
+static int zx_pon_hw_ploam_tx_sn(const u8 frame[ZXPON_PLOAM_LEN])
+{
+	u32 lo, hi, latched, reg;
+
+	if (!zx_pon_hw)
+		return -ENODEV;
+	zx_pon_hw_apply_profiles_locked();
+	/*
+	 * The vendor's setSnMIC() never consults the burst profiles: it writes
+	 * SN/MIC/slot and kicks.  Bailing out with -EBUSY when no profile had
+	 * been received yet was wrong and fatal during O2-3 - the OLT may not
+	 * have delivered one before it asks for the serial number, and the
+	 * persisted log shows exactly that (st=O2-3 with sn_kick=0, i.e. not a
+	 * single attempt was ever made).  Hw_Init already programmed the
+	 * default registration profile, which is what this burst uses.
+	 */
+	if (!zx_profiles_valid())
+		zx_sn_noprof_n++;
+	reg = zx_xmac_r(0x16611);
+	latched = reg & 1;
+	/* bit1 is a sticky "the MAC has actually put a serial number on the
+	 * fibre at least once" flag: a working HX5-9saLite reads 0x3 here on
+	 * the same fibre, while this board never leaves 0x1.  It survives a
+	 * LOS/O1 fallback, so it is the honest proof we are looking for. */
+	if (reg & 2)
+		zx_sn_hw_sent = 1;
+	/* The latch dropping between two kicks is the only proof that the
+	 * MAC really put a serial number on the fibre. */
+	if (zx_sn_armed && !latched)
+		zx_sn_done_n++;
+	zx_sn_armed = 1;
+	/*
+	 * 0x16611 bit0 is a latch, not a pulse register.  The MAC clears it
+	 * once it has actually put the burst on the fibre; with no grant it
+	 * stays set forever.  The vendor calls setSnMIC() once per Profile, so
+	 * if that single window is missed the MAC is never asked again.
+	 * We re-arm on every Profile and once a second, but writing 1 to a bit
+	 * that is already 1 is not a new request - measured on the live line
+	 * the SN was kicked exactly once (rx climbing, tx=0, 0x16611 stuck at
+	 * 1).  Drop the stale latch before re-arming so each Profile really
+	 * produces a 0->1 edge.  The clear and the set are a few register
+	 * writes apart, far inside the OLT's SN window, so an in-flight burst
+	 * is not endangered.
+	 */
+	if (latched) {
+		zx_xmac_rmw(0x16611, 0x1, 0);
+		zx_sn_rearm_n++;
+	}
+	/*
+	 * Program the random delay every time, exactly like the vendor's
+	 * Set_Random_Delay() right before setSnMIC().  This driver used to
+	 * leave 0x16503 at whatever the bootloader left (0 on this board);
+	 * the O2-3 snapshot of a working HX5-9saLite on the same fibre shows
+	 * 0x7391 there.  A zero delay is not a "send immediately" request -
+	 * the MAC simply never schedules the burst.
+	 */
+	zx_xmac_w(0x16503, zx_sn_rand_delay());
+	memcpy(&lo, frame + 40, 4);
+	memcpy(&hi, frame + 44, 4);
+	zx_xmac_w(0x1663e, __swab32(lo));
+	zx_xmac_w(0x1663f, __swab32(hi));
+	zx_xmac_rmw(0x16611, 0, 0x1);
+	zx_sn_kick_n++;
+	return 0;
 }
 
 /* fi_Configure_Ponmac_Set_Gpon_Enable(1): data upstream plus downstream. */
@@ -775,7 +1169,7 @@ static void zxpon_poll_ploam(void)
 		if (!zx_pon_hw_ploam_rx(frame))
 			break;
 		zx_ploam_rx_n++;
-		zx_last_rx_id = frame[2];
+		zx_ploam_note_ds(frame);
 		zx_ploam_log_put('R', frame);
 		zxpon_rx_ploam(&zx_state, frame);
 	}
@@ -784,7 +1178,9 @@ static void zxpon_poll_ploam(void)
 
 		if (!zxpon_peek_ploam(&zx_state, frame))
 			break;
-		ret = zx_pon_hw_ploam_tx(frame);
+		/* Serial Number has its own hardware path; see above. */
+		ret = frame[2] == ZXPON_US_SERIAL_NUMBER ?
+			zx_pon_hw_ploam_tx_sn(frame) : zx_pon_hw_ploam_tx(frame);
 		if (ret) {
 			/* -EBUSY between bursts is the normal state, not a fault. */
 			if (ret == -EBUSY)
@@ -794,6 +1190,10 @@ static void zxpon_poll_ploam(void)
 			break;
 		}
 		zxpon_take_ploam(&zx_state, frame);
+		if (frame[2] == ZXPON_US_KEY_REPORT)
+			zx_ploam_key_rep_n++;
+		else if (frame[2] == ZXPON_US_REGISTRATION)
+			zx_ploam_regid_n++;
 		zx_ploam_log_put('T', frame);
 	}
 }
@@ -818,15 +1218,39 @@ static void zxpon_apply_carrier(void)
 static void zxpon_tick_work(struct work_struct *work)
 {
 	static unsigned int sn_tick;
+	static int prev_state;
 
 	mutex_lock(&zx_pon_lock);
 	if (zx_alive) {
+		int st;
+
 		zxpon_tick(&zx_state, 100);
+		/*
+		 * The per-message counters below describe one activation, not the
+		 * life of the driver.  An OLT that deactivates us and starts over
+		 * must not inherit "key_ctrl_rx=1" from the previous round: that
+		 * is precisely the flag a live session will be read for, and a
+		 * stale one would make a broken round look complete.
+		 */
+		st = zxpon_state(&zx_state);
+		if (st == ZXPON_O1 && prev_state != ZXPON_O1) {
+			zx_ploam_assign_n = 0;
+			zx_ploam_key_ctrl_n = 0;
+			zx_ploam_key_rep_n = 0;
+			zx_ploam_regid_n = 0;
+		}
+		prev_state = st;
 		if (++sn_tick >= 10) {
 			sn_tick = 0;
 			zxpon_retry_sn(&zx_state);
 		}
 		zxpon_poll_ploam();
+		/* Mirror the state and every learned profile into the MAC in
+		 * the same tick that changed them: the vendor does this inside
+		 * its activation handlers, and without it the MAC may see a
+		 * grant window but has no profile or Alloc-ID to match.
+		 */
+		zx_pon_hw_apply_state_locked();
 		zxpon_provision_locked();
 	}
 	mutex_unlock(&zx_pon_lock);
@@ -879,21 +1303,195 @@ static ssize_t pon_hw_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
 	u16 alloc = 0;
-	int alloc_ok;
+	int alloc_ok, hs;
+	u32 prof;
 
 	mutex_lock(&zx_pon_lock);
 	alloc_ok = zxpon_alloc_id(&zx_state, &alloc);
+	hs = zx_hw_state_applied;
+	prof = zx_xmac_r(0x1650a);
 	mutex_unlock(&zx_pon_lock);
 	return sysfs_emit(buf,
 		"mapped=%u rx_pending=%08x tx_kick=%08x "
 		"rx=%u tx=%u txerr=%u busy=%u last_rx_id=%02x data=%u micbad=%u "
-		"alloc=%04x alloc_valid=%u\n",
+		"alloc=%04x alloc_valid=%u hwstate=%d profbits=%04x "
+		"sn_kick=%u sn_rearm=%u sn_done=%u sn_latch=%u sn_sent=%u "
+		"up_fix=%u noprof=%u\n",
 		zx_pon_hw ? 1 : 0, zx_xmac_r(ZX_PON_RX_PENDING),
 		zx_xmac_r(ZX_PON_TX_KICK), zx_ploam_rx_n, zx_ploam_tx_n,
 		zx_ploam_txerr_n, zx_ploam_busy_n, zx_last_rx_id, zx_hw_data_on,
-		zx_state.mic_bad_n, alloc, alloc_ok);
+		zx_state.mic_bad_n, alloc, alloc_ok, hs, prof & 0xffff,
+		zx_sn_kick_n, zx_sn_rearm_n, zx_sn_done_n,
+		zx_pon_hw ? (zx_xmac_r(0x16611) & 1) : 0, zx_sn_hw_sent,
+		zx_up_fix_n, zx_sn_noprof_n);
 }
 static DEVICE_ATTR_RO(pon_hw);
+
+/*
+ * Activation verdict on one screen.
+ *
+ * npu.ko (the ZWRT build of this same driver) keeps a debugfs status block
+ * whose fields read like a checklist: init_stage, serdes_sequence,
+ * sn_burst_tx_cnt, xgmac_sn_reg, last_ploam_id, key_ctrl_rx, key_report_tx,
+ * regid_set.  Read in order they are the G.987.3 walk itself, and the value
+ * of that layout is not the individual numbers - pon_hw already prints them -
+ * but the fact that the first one that stops moving names the step that is
+ * broken.
+ *
+ * This attribute does the same job for this board, from what it can actually
+ * observe.  It deliberately does not invent a serdes_sequence: the 49-word
+ * lane image lives at 0x16000000, outside the PON MAC mapping, and is owned
+ * by phy-zx279133-pon-serdes; reporting a fake field would hide the one case
+ * that matters (the image did not take).  Everything below is either a
+ * counter that only moves when the hardware moved, or a register the MAC
+ * itself maintains.
+ *
+ * Two registers are worth knowing:
+ *   0x16611 bit0  SN kick latch - the MAC clears it once the burst left
+ *                 (or, on a fibre with no grant, leaves it set forever);
+ *                 bit1 is sticky "a serial number has been on the fibre".
+ *   0x16500       the MAC's own shadow of the O-state (bits 4:0) and ONU-ID
+ *                 (bits 25:16).  Comparing it with the software state is the
+ *                 fastest way to see "software thinks O5, MAC never left
+ *                 O2-3", which is exactly the failure this board had.
+ */
+static const char *zx_stage_name(int st, int los, u32 ds, int nprof, u32 kick,
+				 int sent, u16 onu, u32 key_ctrl, u32 key_rep)
+{
+	bool onu_ok = onu != 0 && onu != ZXPON_BCAST_ONUID;
+
+	if (los)
+		return "o1_dark";
+	if (!ds)
+		return "o2_3_listen";
+	if (!nprof)
+		return "o2_3_no_profile";
+	/*
+	 * An assigned ONU-ID is proof on its own that the serial number left the
+	 * ONU: the OLT only answers it after decoding a burst.  Checking the
+	 * local latch first reported "sn_never_left" during a bench rehearsal
+	 * that had reached O5, because without a real grant the MAC never clears
+	 * 0x16611 bit 0.  On a live fibre both agree; with an injected OLT only
+	 * this order is right.
+	 */
+	if (onu_ok) {
+		if (st != ZXPON_O5)
+			return "o4_ranging";
+		if (!key_ctrl)
+			return "o5_no_key_control";
+		if (!key_rep)
+			return "o5_key_report_missing";
+		return "o5_keyed";
+	}
+	if (!kick)
+		return "o2_3_sn_not_kicked";
+	if (!sent)
+		return "o2_3_sn_never_left";
+	return "o3_sn_accepted";
+}
+
+/* The single next event the ONU is waiting for.  "none" means fully done. */
+static const char *zx_stage_blocker(int st, int los, u32 ds, int nprof,
+				    u32 kick, int sent, u16 onu, u32 key_ctrl,
+				    u32 key_rep)
+{
+	bool onu_ok = onu != 0 && onu != ZXPON_BCAST_ONUID;
+
+	if (los)
+		return "no_light";
+	if (!ds)
+		return "no_downstream_ploam";
+	if (!nprof)
+		return "no_burst_profile";
+	if (onu_ok) {
+		if (st != ZXPON_O5)
+			return "ranging_pending";
+		if (!key_ctrl)
+			return "no_key_control";
+		if (!key_rep)
+			return "no_key_report";
+		return "none";
+	}
+	if (!kick)
+		return "sn_not_queued";
+	if (!sent)
+		return "sn_never_on_fibre";
+	return "no_onu_id";
+}
+
+static ssize_t pon_stage_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	const char *name, *blocker, *swname;
+	u32 x16100 = 0, x16105 = 0, x16611 = 0, x16500 = 0, shadow_st = 0;
+	u32 shadow_onu = 0, kick = 0, key_ctrl, key_rep, nprof = 0, bits = 0;
+	int st, los, lods, n, sent;
+	u16 onu, alloc;
+	int alloc_ok;
+	char line[9];
+
+	if (!zx_pon_hw)
+		return sysfs_emit(buf,
+			"stage=hw_not_mapped blocker=hw_not_mapped\n"
+			"hint: echo map > pon_arm\n");
+
+	mutex_lock(&zx_pon_lock);
+	st = zxpon_state(&zx_state);
+	los = zx_state.los;
+	lods = zx_state.lods;
+	onu = zx_state.onu_id;
+	kick = zx_sn_kick_n;
+	sent = zx_sn_hw_sent;
+	key_ctrl = zx_ploam_key_ctrl_n;
+	key_rep = zx_ploam_key_rep_n;
+	for (n = 0; n < 4; n++) {
+		if (!zx_state.profile[n].valid)
+			continue;
+		nprof++;
+		bits |= 1u << n;
+	}
+	x16100 = zx_xmac_r(0x16100);
+	x16105 = zx_xmac_r(0x16105);
+	x16611 = zx_xmac_r(0x16611);
+	x16500 = zx_xmac_r(0x16500);
+	name = zx_stage_name(st, los, zx_ploam_ds_n, nprof, kick, sent, onu,
+			     key_ctrl, key_rep);
+	blocker = zx_stage_blocker(st, los, zx_ploam_ds_n, nprof, kick, sent,
+				   onu, key_ctrl, key_rep);
+	swname = zxpon_state_name(&zx_state);
+	alloc = zx_state.alloc_id;
+	alloc_ok = zx_state.alloc_valid;
+	/* The tick may hold this lock; the shadow is a plain read, so take it
+	 * here rather than re-locking around four more accesses.
+	 */
+	mutex_unlock(&zx_pon_lock);
+
+	for (n = 0; n < 8; n++)
+		line[n] = (x16105 >> n) & 1 ? '1' : '0';
+	line[8] = 0;
+	shadow_st = x16500 & 0x1f;
+	shadow_onu = (x16500 >> 16) & 0x3ff;
+
+	return sysfs_emit(buf,
+		"stage=%s blocker=%s\n"
+		"sw state=%s los=%d lods=%d onu=%04x alloc=%04x/%d\n"
+		"hw 16100=%08x 16105=%08x (%s b4=ds_lost)\n"
+		"hw 16500=%08x mac_o_state=%u mac_onu=%03x\n"
+		"sn kick=%u rearm=%u done=%u sent=%u latch=%u noprof=%u\n"
+		"ploam ds=%u ring_rx=%u tx=%u busy=%u txerr=%u last_id=%02x\n"
+		"ploam assign=%u key_ctrl_rx=%u key_report_tx=%u regid_set=%u\n"
+		"profile learned=%u mask=%x\n",
+		name, blocker, swname, los, lods, onu, alloc, alloc_ok,
+		x16100, x16105, line,
+		x16500, shadow_st, shadow_onu,
+		kick, zx_sn_rearm_n, zx_sn_done_n, sent,
+		(x16611 & 1), zx_sn_noprof_n,
+		zx_ploam_ds_n, zx_ploam_rx_n, zx_ploam_tx_n, zx_ploam_busy_n,
+		zx_ploam_txerr_n, zx_last_rx_id,
+		zx_ploam_assign_n, key_ctrl, key_rep, zx_ploam_regid_n > 0,
+		nprof, bits);
+}
+static DEVICE_ATTR_RO(pon_stage);
 
 /* The OLT's burst profiles are the one input still missing from our upstream
  * path.  Expose exactly what G.987.3 gives us so a live capture can be read
@@ -1307,6 +1905,30 @@ static ssize_t pon_ploam_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(pon_ploam);
 
+/* Raw RX message-ID histogram: no MIC filter, no zxpon_for_us() filter. */
+static ssize_t pon_rxraw_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	static const char hex[] = "0123456789abcdef";
+	ssize_t len = 0;
+	int i, j;
+
+	len += sysfs_emit_at(buf, len, "raw downstream message IDs (pre-MIC):\n");
+	for (i = 0; i < 256; i++) {
+		if (!zx_rx_raw_id_hist[i])
+			continue;
+		len += sysfs_emit_at(buf, len, "id=%02x n=%u last=", i,
+				     zx_rx_raw_id_hist[i]);
+		for (j = 0; j < 8; j++)
+			len += sysfs_emit_at(buf, len, "%c%c",
+				hex[zx_rx_raw_last[i][j] >> 4],
+				hex[zx_rx_raw_last[i][j] & 0xf]);
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(pon_rxraw);
+
 static ssize_t pon_bench_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
@@ -1513,8 +2135,17 @@ static int zxpon_ploam_rx_cmd(struct sk_buff *skb, struct genl_info *info)
 		return -EINVAL;
 	memcpy(frame, nla_data(info->attrs[ZXPON_A_PLOAM_FRAME]),
 	       ZXPON_PLOAM_LEN);
-	zxpon_ploam_seal(frame);
+	/*
+	 * These are downstream frames, so the MIC has to be computed with the
+	 * downstream direction prefix.  zxpon_ploam_seal() is the upstream
+	 * helper (used when queuing our own replies) and sealing with it here
+	 * made every injected frame fail zxpon_ploam_mic_ok() and come back as
+	 * -EBADMSG, which is why the bench walk to O5 stopped working once the
+	 * strict MIC check was restored on 2026-11-26.
+	 */
+	zxpon_ploam_seal_dir(frame, ZXPON_MIC_DS);
 	mutex_lock(&zx_pon_lock);
+	zx_ploam_note_ds(frame);
 	zx_ploam_log_put('I', frame);
 	ret = zxpon_rx_ploam(&zx_state, frame);
 	mutex_unlock(&zx_pon_lock);
@@ -1732,6 +2363,8 @@ void zx279133_pon_attach(struct net_device *ndev)
 		dev_warn(&ndev->dev, "omci_transport sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_hw))
 		dev_warn(&ndev->dev, "pon_hw sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_stage))
+		dev_warn(&ndev->dev, "pon_stage sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_profile))
 		dev_warn(&ndev->dev, "pon_profile sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_tables))
@@ -1746,6 +2379,8 @@ void zx279133_pon_attach(struct net_device *ndev)
 		dev_warn(&ndev->dev, "pon_omci sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_ploam))
 		dev_warn(&ndev->dev, "pon_ploam sysfs not created\n");
+	if (device_create_file(&ndev->dev, &dev_attr_pon_rxraw))
+		dev_warn(&ndev->dev, "pon_rxraw sysfs not created\n");
 	if (device_create_file(&ndev->dev, &dev_attr_pon_bench))
 		dev_warn(&ndev->dev, "pon_bench sysfs not created\n");
 	zx_omci = alloc_netdev(0, "omci", NET_NAME_UNKNOWN, zxpon_omci_setup);
@@ -1791,6 +2426,7 @@ void zx279133_pon_stop(void)
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_state);
 		device_remove_file(&zx_wan->dev, &dev_attr_omci_transport);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_hw);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_stage);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_profile);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_tables);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_probe);
@@ -1798,6 +2434,7 @@ void zx279133_pon_stop(void)
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_reg);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_omci);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_ploam);
+		device_remove_file(&zx_wan->dev, &dev_attr_pon_rxraw);
 		device_remove_file(&zx_wan->dev, &dev_attr_pon_bench);
 	}
 	zx_pon_hw = NULL;
@@ -1814,3 +2451,98 @@ void zx279133_pon_stop(void)
 	zx_green = NULL;
 	zx_wan = NULL;
 }
+
+/* ------------------------------------------------------------------------
+ * BOSA control bus: bit-banged I2C on the two pins the module's MCU is wired
+ * to.  ZWRT-Beta-1.4.0 (f7005mv3, same SoC) does exactly this in device tree
+ * with "i2c-gpio" and scl-gpios/sda-gpios; on this board the same two pads are
+ * p0-6 (SCL) and p0-7 (SDA), i.e. gpio 519/520 (bank0 offset = pin + 1).  The
+ * vendor's own firmware reaches the module at 0x50/0x51 over this bus.
+ *
+ * Registered as adapter 0 so the vendor userspace tool (zte-core: "ddm",
+ * "calibrate") finds it exactly as it does on ZWRT, where /dev/i2c-0 is the
+ * BOSA bus.  Open drain is emulated the way the pads need it: a logical 1 is
+ * "release the line" (input, pull-up does the rest), a logical 0 drives low.
+ * ---------------------------------------------------------------------- */
+#define ZX_BOSA_SCL_GPIO	519
+#define ZX_BOSA_SDA_GPIO	520
+
+static struct gpio_desc *zx_bosa_scl_desc;
+static struct gpio_desc *zx_bosa_sda_desc;
+static struct i2c_algo_bit_data zx_bosa_algo;
+static struct i2c_adapter zx_bosa_adap = {
+	.owner		= THIS_MODULE,
+	.class		= I2C_CLASS_HWMON,
+	.nr		= 0,
+	.name		= "zx279133-bosa",
+};
+
+static void zx_bosa_setsda(void *data, int state)
+{
+	if (!zx_bosa_sda_desc)
+		return;
+	if (state)
+		gpiod_direction_input(zx_bosa_sda_desc);
+	else
+		gpiod_direction_output(zx_bosa_sda_desc, 0);
+}
+
+static void zx_bosa_setscl(void *data, int state)
+{
+	if (!zx_bosa_scl_desc)
+		return;
+	if (state)
+		gpiod_direction_input(zx_bosa_scl_desc);
+	else
+		gpiod_direction_output(zx_bosa_scl_desc, 0);
+}
+
+static int zx_bosa_getsda(void *data)
+{
+	return zx_bosa_sda_desc ? gpiod_get_value(zx_bosa_sda_desc) : 0;
+}
+
+static int zx_bosa_getscl(void *data)
+{
+	return zx_bosa_scl_desc ? gpiod_get_value(zx_bosa_scl_desc) : 0;
+}
+
+static int __init zx_bosa_i2c_init(void)
+{
+	int ret;
+
+	zx_bosa_scl_desc = gpio_to_desc(ZX_BOSA_SCL_GPIO);
+	zx_bosa_sda_desc = gpio_to_desc(ZX_BOSA_SDA_GPIO);
+	if (!zx_bosa_scl_desc || !zx_bosa_sda_desc) {
+		pr_err("zx-bosa: gpio %d/%d not found, no BOSA bus\n",
+		       ZX_BOSA_SCL_GPIO, ZX_BOSA_SDA_GPIO);
+		return -ENODEV;
+	}
+	ret = gpio_request(ZX_BOSA_SCL_GPIO, "zx-bosa-scl");
+	if (ret)
+		pr_warn("zx-bosa: scl request %d\n", ret);
+	ret = gpio_request(ZX_BOSA_SDA_GPIO, "zx-bosa-sda");
+	if (ret)
+		pr_warn("zx-bosa: sda request %d\n", ret);
+	gpiod_direction_input(zx_bosa_scl_desc);
+	gpiod_direction_input(zx_bosa_sda_desc);
+
+	memset(&zx_bosa_algo, 0, sizeof(zx_bosa_algo));
+	zx_bosa_algo.setsda = zx_bosa_setsda;
+	zx_bosa_algo.setscl = zx_bosa_setscl;
+	zx_bosa_algo.getsda = zx_bosa_getsda;
+	zx_bosa_algo.getscl = zx_bosa_getscl;
+	zx_bosa_algo.udelay = 10;
+	zx_bosa_algo.timeout = HZ / 10;
+	zx_bosa_adap.algo_data = &zx_bosa_algo;
+
+	ret = i2c_bit_add_numbered_bus(&zx_bosa_adap);
+	if (ret) {
+		pr_err("zx-bosa: i2c_bit_add_numbered_bus failed %d\n", ret);
+		return ret;
+	}
+	pr_info("zx-bosa: adapter %d on gpio %d/%d (scl/sda)\n",
+		zx_bosa_adap.nr, ZX_BOSA_SCL_GPIO, ZX_BOSA_SDA_GPIO);
+	return 0;
+}
+late_initcall(zx_bosa_i2c_init);

@@ -193,28 +193,48 @@ static void zxpon_put_be16(uint8_t *p, uint16_t v)
 	p[1] = (uint8_t)v;
 }
 
-static void zxpon_ploam_mic(const uint8_t frame[48], uint8_t mic[8])
+/*
+ * G.987.3 11.4.3: the MIC is CMAC over a one-octet direction prefix followed
+ * by the first 40 octets of the PLOAM.  The vendor does exactly this in
+ * Drv_PloamuMic_Generate_Activation (prefix 0x02) and
+ * Drv_PloamdMic_Verify_Activation (prefix 0x01), with the same 0x55 key.
+ * Sealing without the prefix produced a frame the Huawei OLT silently
+ * ignored: we saw our SN leave the MAC once and never see an ONU-ID reply.
+ */
+static void zxpon_ploam_mic(const uint8_t frame[48], uint8_t dir, uint8_t mic[8])
 {
-	uint8_t mac[16];
+	uint8_t msg[41], mac[16];
 
-	zxpon_cmac(zxpon_default_ik, frame, 40, mac);
+	msg[0] = dir;
+	memcpy(msg + 1, frame, 40);
+	zxpon_cmac(zxpon_default_ik, msg, sizeof(msg), mac);
 	memcpy(mic, mac, 8);
+}
+
+void zxpon_ploam_seal_dir(uint8_t frame[48], uint8_t dir)
+{
+	uint8_t mic[8];
+
+	zxpon_ploam_mic(frame, dir, mic);
+	memcpy(frame + 40, mic, 8);
+}
+
+int zxpon_ploam_mic_ok_dir(const uint8_t frame[48], uint8_t dir)
+{
+	uint8_t mic[8];
+
+	zxpon_ploam_mic(frame, dir, mic);
+	return memcmp(mic, frame + 40, 8) == 0;
 }
 
 void zxpon_ploam_seal(uint8_t frame[48])
 {
-	uint8_t mic[8];
-
-	zxpon_ploam_mic(frame, mic);
-	memcpy(frame + 40, mic, 8);
+	zxpon_ploam_seal_dir(frame, ZXPON_MIC_US);
 }
 
 int zxpon_ploam_mic_ok(const uint8_t frame[48])
 {
-	uint8_t mic[8];
-
-	zxpon_ploam_mic(frame, mic);
-	return memcmp(mic, frame + 40, 8) == 0;
+	return zxpon_ploam_mic_ok_dir(frame, ZXPON_MIC_DS);
 }
 
 static int zxpon_queue_ploam(struct zxpon *z, uint8_t id, uint16_t onu,
@@ -415,23 +435,16 @@ int zxpon_rx_ploam(struct zxpon *z, const uint8_t frame[48])
 	const uint8_t *c;
 
 	/*
-	 * A broadcast frame cannot be authenticated before registration.  The
-	 * OLT stamps this field with a key the ONU does not hold yet, so no
-	 * guess reproduces it: checked against two real 0x01 frames from the
-	 * Huawei OLT on 2026-11-26, CMAC with the default key over every
-	 * prefix of the message and every truncation of the result matches
-	 * nothing in the trailing eight octets.
-	 *
-	 * Rejecting those frames is what kept the board parked in O2-3 with
-	 * 152 frames received and not one profile learned.  Accept broadcast,
-	 * count the mismatch, and keep the strict check for directed
-	 * messages - those are addressed to our ONU-ID and we do have a key
-	 * by the time they arrive.
+	 * The 2026-11-26 "broadcast cannot be authenticated" conclusion was
+	 * wrong: the CMAC is taken over a one-octet direction prefix, not over
+	 * the frame alone.  Recomputed with prefix 0x01, both real Huawei
+	 * broadcast Profiles match byte for byte with the default 0x55 key.
+	 * Restore the strict check for every frame; the earlier bypass hid a
+	 * bug in our own MIC rather than a missing OLT key.
 	 */
 	if (!zxpon_ploam_mic_ok(frame)) {
 		z->mic_bad_n++;
-		if (zxpon_be16(frame) != ZXPON_BCAST_ONUID)
-			return -1;
+		return -1;
 	}
 	if (z->los)
 		return 0;
@@ -470,6 +483,20 @@ int zxpon_rx_ploam(struct zxpon *z, const uint8_t frame[48])
 		memcpy(p->delimiter, c + 3, 8);
 		memcpy(p->preamble, c + 13, 8);
 		memcpy(p->pon_tag, c + 21, 8);
+		/*
+		 * The vendor re-arms the serial-number answer from inside the
+		 * downstream Profile handler (p_o2_3_profile_msg -> setSnMIC),
+		 * i.e. in the very same receive interrupt that carried the
+		 * Profile.  That timing matters: the OLT opens a short SN
+		 * window immediately after each broadcast Profile, and a
+		 * free-running 1 s retry misses every one of those windows.
+		 * Re-queue here so the hardware layer's TX loop, which runs
+		 * right after the RX loop in the same poll, can fire the SN
+		 * while the window is still open.
+		 */
+		if (z->state == ZXPON_O23 && !z->los && !z->lods &&
+		    z->has_identity)
+			zxpon_retry_sn(z);
 		/* A directed Profile in O5 is the one frame that needs an ACK. */
 		if (z->state == ZXPON_O5 && onu != ZXPON_BCAST_ONUID)
 			zxpon_queue_ploam(z, ZXPON_US_ACK, z->onu_id, &id, 1);
