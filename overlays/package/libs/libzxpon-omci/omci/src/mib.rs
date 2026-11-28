@@ -441,6 +441,20 @@ impl Mib {
                 .read_only(5, vec![0, 0]),
         );
 
+        // HX5-9saLite presents four physical Ethernet UNIs matching its four LAN
+        // ports. Keep them as autonomous ONU-created instances so an OLT that
+        // issues GET/GET-NEXT on class 264 sees real entities rather than
+        // UNKNOWN_INSTANCE. The platform data path keys off VEIP/bridges, not
+        // UNI-G (see data_path_graph's GRAPH_CLASSES), so these cannot change
+        // forwarding or the committed hardware queue bindings.
+        for entity_id in 1..=ETHERNET_UNI_COUNT {
+            mib.insert(
+                CLASS_UNI_G,
+                entity_id,
+                entity_from_definition(CLASS_UNI_G, None).expect("UNI-G schema is registered"),
+            );
+        }
+
         mib.insert(
             CLASS_OLT_G,
             0,
@@ -1864,7 +1878,7 @@ mod tests {
     impl Default for IdentityConfig {
         fn default() -> Self {
             Self {
-                omcc_version: 0xb0,
+                omcc_version: 0xa0,
                 disable_enhanced_security: false,
                 vendor_id: b"TEST".to_vec(),
                 equipment_id: Vec::new(),
@@ -2330,5 +2344,84 @@ mod tests {
 
         assert_eq!(mib.dispatch(&set).result(), Some(RESULT_SUCCESS));
         assert_eq!(mib.entities[&filter].attributes[&1].value, value);
+    }
+
+    #[test]
+    fn four_uni_g_instances_are_autonomous_and_gettable() {
+        let mut mib = Mib::from_identity(&IdentityConfig::default());
+        for entity_id in 1..=ETHERNET_UNI_COUNT {
+            assert!(mib.autonomous_defaults.contains_key(&(CLASS_UNI_G, entity_id)));
+            let get = Request {
+                encoding: super::super::protocol::Encoding::Baseline,
+                tci: 1,
+                message_type: 0x44,
+                action: ACTION_GET,
+                class_id: CLASS_UNI_G,
+                entity_id,
+                attribute_mask: 0x0002,
+                payload: &[],
+                content: &[],
+            };
+            assert_eq!(mib.dispatch(&get).result(), Some(RESULT_SUCCESS));
+        }
+        // Entity 0 was never provisioned: four LAN ports, not five.
+        let get_missing = Request {
+            encoding: super::super::protocol::Encoding::Baseline,
+            tci: 1,
+            message_type: 0x44,
+            action: ACTION_GET,
+            class_id: CLASS_UNI_G,
+            entity_id: 0,
+            attribute_mask: 0x0002,
+            payload: &[],
+            content: &[],
+        };
+        assert_eq!(mib.dispatch(&get_missing).result(), Some(RESULT_UNKNOWN_INSTANCE));
+    }
+
+    #[test]
+    fn mib_upload_and_reset_survive_a_full_paging_round() {
+        let mut mib = Mib::from_identity(&IdentityConfig::default());
+        let upload = Request {
+            encoding: super::super::protocol::Encoding::Baseline,
+            tci: 1,
+            message_type: 0x44,
+            action: ACTION_MIB_UPLOAD,
+            class_id: CLASS_ONU_DATA,
+            entity_id: 0,
+            attribute_mask: 0,
+            payload: &[],
+            content: &[],
+        };
+        let header = mib.dispatch(&upload);
+        let count = u16::from_be_bytes([header.as_bytes()[8], header.as_bytes()[9]]);
+        assert!(count > 0, "MIB upload must advertise at least one record");
+        assert_eq!(count as usize, mib.upload_snapshot.len());
+
+        // Walk every sequence number; the last one must be a clean terminator.
+        for sequence in 0..count {
+            let next = Request {
+                attribute_mask: sequence,
+                action: ACTION_MIB_UPLOAD_NEXT,
+                ..upload
+            };
+            let response = mib.dispatch(&next);
+            assert!(response.as_bytes().len() >= 14, "upload-next keeps a 48-byte envelope");
+        }
+        let past_end = Request {
+            attribute_mask: count,
+            action: ACTION_MIB_UPLOAD_NEXT,
+            ..upload
+        };
+        let terminator = mib.dispatch(&past_end);
+        assert_eq!(terminator.as_bytes()[8..14], [0u8; 6], "end-of-MIB record is all zero");
+
+        let reset = Request {
+            action: ACTION_MIB_RESET,
+            ..upload
+        };
+        assert_eq!(mib.dispatch(&reset).result(), Some(0));
+        assert!(mib.upload_snapshot.is_empty());
+        assert_eq!(mib.entities, mib.autonomous_defaults);
     }
 }

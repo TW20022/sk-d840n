@@ -112,7 +112,7 @@ int zx_migrate(const char *destination, const char *legacy)
 	if (!output) { result = -errno; close(descriptor); unlink(temporary); return result; }
 	if (fprintf(output, "config pon 'pon'\n\toption enabled '%d'\n\toption mode 'xgpon'\n"
 		"\toption serial_number '%s'\n\toption registration_id_format 'hex'\n"
-		"\toption registration_id '%s'\n\toption omcc_version '0xb0'\n"
+		"\toption registration_id '%s'\n\toption omcc_version '0xa0'\n"
 		"\toption disable_enhanced_security '0'\n", serial[0] && registration[0] ? 1 : 0,
 		serial, registration) < 0 || fflush(output) || fsync(descriptor)) result = -EIO;
 	if (fclose(output) && !result) result = -EIO;
@@ -154,9 +154,11 @@ int zx_config_load(struct zx_config *config, const char *directory)
 		config->has_identity = 1;
 	}
 	if (zx_registration(option(ctx, section, "registration_id"), option(ctx, section, "registration_id_format"), config->regid)) goto done;
-	config->identity.omcc_version = 0xb0;
+	/* HX5-9saLite on the live OLT advertises ONU2-G OMCC version 0xa0 (two captures). */
+	config->identity.omcc_version = 0xa0;
 	value = option(ctx, section, "omcc_version");
-	if (value && strcmp(value, "0xb0") && strcmp(value, "0x86")) goto done;
+	if (value && strcmp(value, "0xa0") && strcmp(value, "0xb0") && strcmp(value, "0x86")) goto done;
+	if (value && !strcmp(value, "0xb0")) config->identity.omcc_version = 0xb0;
 	if (value && !strcmp(value, "0x86")) config->identity.omcc_version = 0x86;
 	value = option(ctx, section, "disable_enhanced_security");
 	if (value && strcmp(value, "0") && strcmp(value, "1")) goto done;

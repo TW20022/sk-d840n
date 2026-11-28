@@ -41,7 +41,8 @@ pub struct Agent {
 #[no_mangle]
 pub unsafe extern "C" fn zxpon_omci_new(identity: &Identity) -> *mut Agent {
     let identity = IdentityConfig {
-        omcc_version: if identity.omcc_version == 0 { 0xb0 } else { identity.omcc_version },
+        // 0 means "unset" from the C shim; HX5 on the live OLT advertises 0xa0.
+        omcc_version: if identity.omcc_version == 0 { 0xa0 } else { identity.omcc_version },
         disable_enhanced_security: identity.disable_enhanced_security != 0,
         vendor_id: identity.serial[..4].to_vec(),
         equipment_id: identity.equipment.to_vec(),

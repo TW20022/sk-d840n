@@ -31,7 +31,7 @@ return view.extend({
 			['hardware_version', '硬件版本', 14], ['software_version', '软件版本', 14], ['operator_id', '运营商 ID', 4]].forEach(function(field) {
 			o = s.taboption('identity', form.Value, field[0], field[1]); o.validate = bytes(field[2]); o.retain = true; o.password = field[0] === 'loid_password';
 		});
-		o = s.taboption('advanced', form.ListValue, 'omcc_version', 'OMCC 版本'); o.value('0xb0', '0xb0（默认）'); o.value('0x86', '0x86（兼容模式）'); o.default = '0xb0'; o.rmempty = false;
+		o = s.taboption('advanced', form.ListValue, 'omcc_version', 'OMCC 版本'); o.value('0xa0', '0xa0（默认，HX5 实测）'); o.value('0xb0', '0xb0'); o.value('0x86', '0x86（兼容模式）'); o.default = '0xa0'; o.rmempty = false;
 		o = s.taboption('advanced', form.Flag, 'disable_enhanced_security', '禁用增强认证（Class 332）'); o.default = '0'; o.rmempty = false;
 		o = s.taboption('advanced', form.Value, 'omci_psk', 'OMCI PSK'); o.password = true; o.retain = true;
 		o.validate = function(section, value) { return value === '' || /^[0-9a-fA-F]{32}$/.test(value) || '请输入 32 位十六进制或留空。'; };
