@@ -2358,7 +2358,8 @@ mod tests {
                 action: ACTION_GET,
                 class_id: CLASS_UNI_G,
                 entity_id,
-                attribute_mask: 0x0002,
+                // Attribute 2 (operational state) is 0x8000 >> 1, not 0x0002.
+                attribute_mask: 0x4000,
                 payload: &[],
                 content: &[],
             };
@@ -2372,7 +2373,7 @@ mod tests {
             action: ACTION_GET,
             class_id: CLASS_UNI_G,
             entity_id: 0,
-            attribute_mask: 0x0002,
+            attribute_mask: 0x4000,
             payload: &[],
             content: &[],
         };
