@@ -264,13 +264,13 @@ def dtb_fixture():
             'ngpios': cell(6 if bank == 4 else 16), 'gpio-ranges': cell(1, 0, 60, 6)}})
     nodes.append({'path': '/leds', 'props': {'compatible': b'gpio-leds\0'}})
     for name, (bank, pin, function, color, state, trigger) in gate.PANEL.items():
-        props = {'label': (name + '\0').encode(), 'gpios': cell(bank + 2, pin, 1),
+        props = {'label': (name + '\0').encode(), 'gpios': cell(bank + 2, pin, gate.LED_FLAGS[name]),
                  'default-state': (state + '\0').encode(), 'function': (function + '\0').encode(),
                  'color': cell(color)}
         if trigger:
             props['linux,default-trigger'] = (trigger + '\0').encode()
         nodes.append({'path': '/leds/led-' + name.rsplit(':', 1)[1], 'props': props})
-    nodes += [{'path': '/nppt', 'props': {'compatible': b'zte,zx279133-nppt\0', 'opsd-gpios': cell(4, 1, 0)}},
+    nodes += [{'path': '/nppt', 'props': {'compatible': b'zte,zx279133-nppt\0', 'opsd-gpios': cell(4, 1, 1)}},
               {'path': '/switch', 'props': {}}, {'path': '/switch/ports', 'props': {}}]
     for i, port in ((1, 8), (2, 5), (3, 6), (4, 7)):
         nodes.append({'path': f'/switch/ports/port@{port}', 'props': {'reg': cell(port), 'label': f'lan{i}\0'.encode()}})
@@ -300,8 +300,10 @@ def dtb_tests(dtb=None):
         if node['props'].get('label', b'').rstrip(b'\0').decode() not in gate.PANEL:
             continue
         handle, pin, _ = gate.cells(node['props']['gpios'])
-        for key, value in [('gpios', cell(handle, pin + 1, 1)), ('gpios', cell(handle, pin, 0)),
-                           ('gpios', cell(0xdead, pin, 1)), ('default-state', b'keep\0'),
+        name = node['props']['label'].rstrip(b'\0').decode()
+        flags = gate.LED_FLAGS[name]
+        for key, value in [('gpios', cell(handle, pin + 1, flags)), ('gpios', cell(handle, pin, 1 - flags)),
+                           ('gpios', cell(0xdead, pin, flags)), ('default-state', b'keep\0'),
                            ('color', cell(7)), ('function', b'wrong\0'),
                            ('linux,default-trigger', b'wrong\0'), ('label', b'skyworth:green:wps\0')]:
             broken = copy.deepcopy(nodes)
@@ -336,7 +338,7 @@ def dtb_tests(dtb=None):
             rejected(broken)
         if 'opsd-gpios' in node['props']:
             handle, _, _ = gate.cells(node['props']['opsd-gpios'])
-            for key, value in [('opsd-gpios', cell(handle, 2, 0)), ('leds', cell(1))]:
+            for key, value in [('opsd-gpios', cell(handle, 2, 1)), ('opsd-gpios', cell(handle, 1, 0)), ('leds', cell(1))]:
                 broken = copy.deepcopy(nodes)
                 broken[index]['props'][key] = value
                 rejected(broken)

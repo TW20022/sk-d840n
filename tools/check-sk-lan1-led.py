@@ -26,6 +26,15 @@ PANEL = {
     'skyworth:green:usb1': (1, 5, 'usb', 2, 'off', None),
     'skyworth:green:phone1': (2, 3, 'phone', 2, 'off', None),
 }
+# LOS is the one panel LED whose physical polarity is ACTIVE_HIGH. Two
+# independent proofs on 2026-11-26: the vendor 4.19 DT declares flags 0x01
+# (GPIO_ACTIVE_LOW) while the measured lamp is lit only when the pad is driven
+# high, and reversing this file to ACTIVE_LOW made brightness=1 turn the lamp
+# OFF. Linux dt-bindings defines GPIO_ACTIVE_HIGH=0, GPIO_ACTIVE_LOW=1, so the
+# compiled DTB carries flags 0 for LOS and flags 1 for the other eight LEDs.
+# The gate follows the measured panel, not the vendor's (wrong) declaration.
+ACTIVE_HIGH_LEDS = {'skyworth:red:los'}
+LED_FLAGS = {name: (0 if name in ACTIVE_HIGH_LEDS else 1) for name in PANEL}
 LAN1_NAME = 'skyworth:green:lan1'
 
 
@@ -84,7 +93,7 @@ def validate_dtb(blob):
         assert props.get('function') == function.encode() + b'\0', f'{name}: wrong function'
         assert props.get('linux,default-trigger') == (trigger.encode() + b'\0' if trigger else None), f'{name}: wrong trigger'
         handle, pin, flags = cells(props['gpios'])
-        assert (pin, flags) == (offset, 1), f'{name}: wrong pin/polarity'
+        assert (pin, flags) == (offset, LED_FLAGS[name]), f'{name}: wrong pin/polarity'
         gpio = handles[handle]['props']
         assert b'zte,zx279133-gpio\0' in gpio.get('compatible', b''), f'{name}: unsupported GPIO controller'
         assert gpio.get('status', b'okay\0') in (b'okay\0', b'ok\0'), f'{name}: disabled GPIO controller'
@@ -107,7 +116,11 @@ def validate_dtb(blob):
         assert len(ports) == 1, f'DSA port {port} must remain lan{i}'
     nppt, = [n['props'] for n in nodes if b'zte,zx279133-nppt\0' in n['props'].get('compatible', b'')]
     handle, pin, flags = cells(nppt['opsd-gpios'])
-    assert cells(handles[handle]['props']['reg'])[1] == 0x10d10080 and (pin, flags) == (1, 0), 'optical RX_SD wiring changed'
+    # Measured 2026-11-25 (commit 3c73b42e): the optical signal detect is
+    # active low, so the board DT uses GPIO_ACTIVE_LOW (flags 1). The original
+    # 11-18 gate expected flags 0 and went stale when the DTS polarity was
+    # corrected; keep the gate on the measured wiring, not the old assumption.
+    assert cells(handles[handle]['props']['reg'])[1] == 0x10d10080 and (pin, flags) == (1, 1), 'optical RX_SD wiring changed'
     assert 'leds' not in nppt and 'led-names' not in nppt, 'stale direct LED ownership'
     print('PASS: nine GPIO LEDs plus unique port-8 PHY LAN1, ownership, triggers and DSA mapping; real lamps require observation')
 
